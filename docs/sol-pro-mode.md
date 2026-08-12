@@ -54,6 +54,40 @@ keys=['max_completion_tokens', 'messages', 'model', 'store', 'stream', 'stream_o
 - **`tools`가 요청에 들어온다.** 완전한 에이전트 루프를 원하면 shim이 tool 스펙을
   프롬프트로 내리고, 응답에서 tool call을 파싱해 OpenAI 포맷으로 되돌려야 한다.
 
+### 3. 스트림은 첫 이벤트까지의 시간이 제한된다
+
+`gjc config`의 실측값:
+
+```
+retry.streamFirstEventTimeoutMs = 100000   # 100초
+retry.streamMaxRetries = 5
+retry.requestMaxRetries = 5
+```
+
+Pro는 사소한 질문에도 2분 안팔을 쓴다(실측 125~129초, gjc 시스템 프롬프트 15.8k자 포함).
+그대로 두면 gjc가 100초에 끊고 재시도하며, 뒤달아 도착한 답은 죽은 소켓에 써지고
+(`BrokenPipeError`) **같은 질문에 Pro 메시지를 한 통 더 날린다.**
+
+중요: **SSE 주석(`: ...`)은 이벤트로 치지 않는다.** 주석으로 하트비트를 보내면
+소켓은 살아있지만 타임아웃은 그대로 난다. 내용 없는 찭크(`delta.content = ""`)를
+주기적으로 보내야 한다.
+
+### 4. 추론단계는 메뉴가 아니라 슬라이더다 (2026-08 UI)
+
+예전 동작(`menuitemradio` 목록)은 사라졌고, `[role="slider"]` 하나로 바뀌었다.
+
+| `aria-valuenow` | pill |
+|---|---|
+| 0 | 빠름 |
+| 1 | 중간 |
+| 2 | 높음 |
+| 3 | 매우 높음 |
+| **4** | **Pro** |
+
+엔진은 목록이 비면 fail-closed로 전송을 멈췄다(`'pro' 추론단계 항목 못 찾음`).
+`vendor/patches/0002-effort-slider-2026-08.patch`가 슬라이더를 최소칸으로 정규화한 뒤
+오른쪽으로 밀면서 composer pill을 판정 근거로 읽는다.
+
 ## 최종 구조
 
 ```
