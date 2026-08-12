@@ -15,6 +15,8 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import proc
+
 PLAN_RELPATH = ".ai-bridge/current-plan.md"
 SESSION_RELPATH = ".ai-bridge/lane-session"
 GATE_LOG_LIMIT = 4000
@@ -106,23 +108,21 @@ def implement_command(root: Path, plan: Path, *, first: bool, session: str | Non
 def implement(root: Path, plan: Path, *, first: bool, session: str | None = None) -> str:
     command = implement_command(root, plan, first=first, session=session)
     try:
-        result = subprocess.run(command, cwd=root, capture_output=True, text=True)
+        result = proc.run(command, cwd=root)
     except (OSError, subprocess.SubprocessError) as error:
         raise DriveError(f"gjc could not run: {error}") from error
     if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "").strip().splitlines()
-        raise DriveError(f"gjc exited {result.returncode}: {detail[-1] if detail else 'no detail'}")
-    return (result.stdout or "").strip()
+        raise DriveError(f"gjc exited {result.returncode}: {result.detail()}")
+    return result.stdout.strip()
 
 
 def run_gate(root: Path, gate: str) -> tuple[bool, str]:
     """Run the repository's own gate. Its exit code is the verdict."""
     try:
-        result = subprocess.run(gate, cwd=root, shell=True, capture_output=True, text=True)
+        result = proc.run(gate, cwd=root, shell=True)
     except (OSError, subprocess.SubprocessError) as error:
         raise DriveError(f"gate could not run: {error}") from error
-    output = ((result.stdout or "") + (result.stderr or "")).strip()
-    return result.returncode == 0, output[-GATE_LOG_LIMIT:]
+    return result.returncode == 0, result.output[-GATE_LOG_LIMIT:]
 
 
 def drive(root: Path, intent: str, gate: str, *, max_iters: int, planner, implementer, gate_runner,

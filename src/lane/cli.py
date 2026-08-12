@@ -16,6 +16,7 @@ from pathlib import Path
 
 from . import drive as drive_module
 from . import engine as engine_module
+from . import proc
 from . import paste as paste_module
 from . import review as review_module
 from . import serve as serve_module
@@ -63,6 +64,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    proc.exit_on_sigterm()
     args = build_parser().parse_args(argv)
     try:
         config = _load_config(args.config)

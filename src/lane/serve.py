@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from . import proc
 from .review import browser_env
 
 ROLE_LABELS = {"system": "SYSTEM", "user": "USER", "assistant": "ASSISTANT", "tool": "TOOL"}
@@ -99,18 +100,12 @@ def estimate_tokens(text: str) -> int:
 
 def run_engine(settings: ServeSettings, prompt: str) -> str:
     try:
-        result = subprocess.run(
-            settings.command(prompt),
-            capture_output=True,
-            text=True,
-            timeout=settings.max_wait + 120,
-            env=browser_env(),
-        )
+        result = proc.run(settings.command(prompt), timeout=settings.max_wait + 120,
+                          env=browser_env())
     except (OSError, subprocess.SubprocessError) as error:
         raise ServeError(f"engine could not run: {error}") from error
     if result.returncode != 0:
-        detail = (result.stderr or "").strip().splitlines()
-        raise ServeError(f"engine exited {result.returncode}: {detail[-1] if detail else 'no detail'}")
+        raise ServeError(f"engine exited {result.returncode}: {result.detail()}")
     answer = result.stdout.strip()
     if not answer:
         raise ServeError("engine returned an empty answer (fail-closed)")

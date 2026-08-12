@@ -12,6 +12,7 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import proc
 from .config import Project
 
 class ReviewError(Exception):
@@ -92,13 +93,8 @@ def browser_env(env: dict[str, str] | None = None, *, socket_glob: str = X11_SOC
 
 def ensure_browser(engine: Path, *, python: str | None = None, timeout: float = 180.0) -> str:
     """Ask the engine to start the saved browser profile. Returns its STATUS line."""
-    result = subprocess.run(
-        [python or sys.executable, str(engine), "--ensure-env"],
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        env=browser_env(),
-    )
+    result = proc.run([python or sys.executable, str(engine), "--ensure-env"],
+                      timeout=timeout, env=browser_env())
     for line in reversed((result.stdout + result.stderr).splitlines()):
         if line.startswith("STATUS "):
             return line.strip()
@@ -121,13 +117,11 @@ def ask(engine: Path, project: Project, root: Path, prompt: str, *,
     """Pack the project, ask Sol Pro, and return the answer as text."""
     council = command(engine, project, prompt, include=include, python=python, council=True)
     try:
-        result = subprocess.run(council, cwd=root, env=browser_env(), capture_output=True,
-                                text=True, timeout=project.max_wait + 300)
+        result = proc.run(council, cwd=root, env=browser_env(), timeout=project.max_wait + 300)
     except (OSError, subprocess.SubprocessError) as error:
         raise ReviewError(f"engine could not run: {error}") from error
     if result.returncode != 0:
-        detail = (result.stderr or "").strip().splitlines()
-        raise ReviewError(f"engine exited {result.returncode}: {detail[-1] if detail else 'no detail'}")
+        raise ReviewError(f"engine exited {result.returncode}: {result.detail()}")
     answer = result.stdout.strip()
     if not answer:
         raise ReviewError("engine returned an empty answer (fail-closed)")
@@ -137,6 +131,6 @@ def ask(engine: Path, project: Project, root: Path, prompt: str, *,
 def run(engine: Path, project: Project, root: Path, prompt: str, *,
         include: tuple[str, ...] | None = None, python: str | None = None) -> ReviewOutcome:
     before = responses(root)
-    result = subprocess.run(command(engine, project, prompt, include=include, python=python),
-                            cwd=root, env=browser_env())
+    result = proc.run(command(engine, project, prompt, include=include, python=python),
+                      cwd=root, env=browser_env(), capture=False)
     return ReviewOutcome(returncode=result.returncode, response=newest_new_response(root, before))

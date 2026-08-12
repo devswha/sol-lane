@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from lane import proc
 from lane import serve as serve_module
 
 SETTINGS = serve_module.ServeSettings(engine=Path("/tmp/engine.py"), max_wait=30)
@@ -229,17 +230,20 @@ def test_a_client_hang_up_does_not_take_the_server_down(server):
     assert json.loads(later.read())["choices"][0]["message"]["content"] == "late answer"
 
 
+def stub_engine(monkeypatch, returncode, stdout="", stderr=""):
+    completed = proc.Completed(returncode=returncode, stdout=stdout, stderr=stderr)
+    monkeypatch.setattr(serve_module.proc, "run", lambda *a, **k: completed)
+
+
 def test_run_engine_reports_a_non_zero_exit(monkeypatch):
-    monkeypatch.setattr(serve_module.subprocess, "run",
-                        lambda *a, **k: type("R", (), {"returncode": 3, "stdout": "", "stderr": "boom"})())
+    stub_engine(monkeypatch, 3, stderr="boom")
 
     with pytest.raises(serve_module.ServeError, match="engine exited 3: boom"):
         serve_module.run_engine(SETTINGS, "prompt")
 
 
 def test_run_engine_refuses_an_empty_answer(monkeypatch):
-    monkeypatch.setattr(serve_module.subprocess, "run",
-                        lambda *a, **k: type("R", (), {"returncode": 0, "stdout": "  \n", "stderr": ""})())
+    stub_engine(monkeypatch, 0, stdout="  \n")
 
     with pytest.raises(serve_module.ServeError, match="empty answer"):
         serve_module.run_engine(SETTINGS, "prompt")
