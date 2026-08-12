@@ -59,6 +59,21 @@ def test_command_runs_the_engine_with_an_interpreter(write_config, tmp_path: Pat
     assert command[:2] == ["/usr/bin/python3", str(engine)]
 
 
+def test_pack_bytes_counts_matched_files_once(project_root: Path):
+    (project_root / "src" / "extra.py").write_text("y = 2\n", encoding="utf-8")
+
+    total, count = review_module.pack_bytes(project_root, ("src/**/*.py", "src/app.py"))
+
+    assert count == 2, "overlapping globs must not double-count a file"
+    assert total == sum((project_root / "src" / name).stat().st_size for name in ("app.py", "extra.py"))
+
+
+def test_pack_bytes_ignores_directories_and_misses(project_root: Path):
+    total, count = review_module.pack_bytes(project_root, ("src", "nothing/**/*.py"))
+
+    assert (total, count) == (0, 0)
+
+
 def test_browser_env_keeps_an_existing_display():
     assert review_module.browser_env({"DISPLAY": ":7"})["DISPLAY"] == ":7"
 

@@ -199,6 +199,14 @@ def _drive(config: Config, args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _report_pack_size(root: Path, globs: tuple[str, ...]) -> None:
+    total, count = review_module.pack_bytes(root, globs)
+    print(f"pack       {count} files, {total // 1024} KB")
+    if total > review_module.PACK_WARN_BYTES:
+        print(f"           over {review_module.PACK_WARN_BYTES // 1024} KB — Pro reasons far longer on "
+              "large packs; narrow --include or split the review", file=sys.stderr)
+
+
 def _globs(value: str | None) -> tuple[str, ...] | None:
     if not value:
         return None
@@ -228,6 +236,8 @@ def _review(config: Config, args: argparse.Namespace) -> int:
     if args.dry_run:
         print(" ".join(review_module.command(engine_path, project, args.prompt, include=include)))
         return EXIT_OK
+
+    _report_pack_size(root, include or project.include)
 
     if not review_module.cdp_up():
         status = review_module.ensure_browser(engine_path)

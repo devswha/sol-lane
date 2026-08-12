@@ -22,6 +22,9 @@ class ReviewError(Exception):
 CDP_URL = "http://127.0.0.1:9222/json/version"
 RESPONSE_GLOB = ".insane-review/response_*.md"
 X11_SOCKETS = "/tmp/.X11-unix/X*"
+# Measured: a 297 KB pack kept Pro reasoning past 20 minutes on one question,
+# while ~100 KB packs answer in two. Latency is not linear in pack size.
+PACK_WARN_BYTES = 200_000
 
 
 @dataclass(frozen=True)
@@ -64,6 +67,14 @@ def command(engine: Path, project: Project, prompt: str, *, include: tuple[str, 
             python: str | None = None, council: bool = False) -> list[str]:
     return [python or sys.executable, str(engine),
             *engine_args(project, prompt, include=include, council=council)]
+
+
+def pack_bytes(root: Path, globs: tuple[str, ...]) -> tuple[int, int]:
+    """Total bytes and file count the include globs will pull into the pack."""
+    matched: set[Path] = set()
+    for pattern in globs:
+        matched.update(path for path in root.glob(pattern) if path.is_file())
+    return sum(path.stat().st_size for path in matched), len(matched)
 
 
 def cdp_up(url: str = CDP_URL, *, timeout: float = 3.0) -> bool:
