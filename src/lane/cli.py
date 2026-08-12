@@ -17,6 +17,7 @@ from pathlib import Path
 from . import engine as engine_module
 from . import paste as paste_module
 from . import review as review_module
+from . import serve as serve_module
 from .config import Config, ConfigError, checked_root, find_config, load, secret_markers_in
 
 EXIT_OK = 0
@@ -39,6 +40,12 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("projects", help="list configured projects")
     sub.add_parser("doctor", help="check engine, browser, and project roots")
 
+    serve = sub.add_parser("serve", help="expose Sol Pro as a local OpenAI-compatible endpoint")
+    serve.add_argument("--host", default="127.0.0.1")
+    serve.add_argument("--port", type=int, default=8799)
+    serve.add_argument("--max-wait", type=int, help="override the configured max_wait")
+    serve.add_argument("--force-answer-after", type=int, help="override the configured force_answer_after")
+
     engine = sub.add_parser("engine", help="manage the pinned upstream engine")
     engine_sub = engine.add_subparsers(dest="engine_command", required=True)
     sync = engine_sub.add_parser("sync", help="fetch the pinned engine and apply vendor patches")
@@ -56,6 +63,8 @@ def main(argv: list[str] | None = None) -> int:
             return _doctor(config)
         if args.command == "engine":
             return _engine_sync(config, refresh=args.refresh)
+        if args.command == "serve":
+            return _serve(config, args)
         return _review(config, args)
     except (ConfigError, engine_module.EngineError) as error:
         print(f"lane: {error}", file=sys.stderr)
@@ -119,6 +128,29 @@ def _engine_sync(config: Config, *, refresh: bool) -> int:
     print(f"engine     {result.engine}")
     print(f"upstream   {config.engine.repo}@{config.engine.sha[:12]} ({result.upstream_bytes} bytes)")
     print(f"patches    {applied}")
+    return EXIT_OK
+
+
+def _serve(config: Config, args: argparse.Namespace) -> int:
+    engine_path = engine_module.resolve(_repo_root(config), override=os.environ.get("LANE_ENGINE"))
+    defaults = config.defaults
+    settings = serve_module.ServeSettings(
+        engine=engine_path,
+        model=str(defaults["model"]),
+        require_model=str(defaults["require_model"]),
+        max_wait=args.max_wait if args.max_wait is not None else int(defaults["max_wait"]),
+        force_answer_after=(
+            args.force_answer_after
+            if args.force_answer_after is not None
+            else int(defaults["force_answer_after"])
+        ),
+    )
+    if not review_module.cdp_up():
+        status = review_module.ensure_browser(engine_path)
+        if not review_module.cdp_up():
+            print(f"lane: no CDP browser on 9222 after --ensure-env ({status})", file=sys.stderr)
+            return EXIT_DELIVERY
+    serve_module.serve(settings, host=args.host, port=args.port)
     return EXIT_OK
 
 

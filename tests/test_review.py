@@ -59,6 +59,20 @@ def test_command_runs_the_engine_with_an_interpreter(write_config, tmp_path: Pat
     assert command[:2] == ["/usr/bin/python3", str(engine)]
 
 
+def test_browser_env_keeps_an_existing_display():
+    assert review_module.browser_env({"DISPLAY": ":7"})["DISPLAY"] == ":7"
+
+
+def test_browser_env_derives_the_display_from_a_running_x_socket(tmp_path: Path):
+    (tmp_path / "X0").touch()
+
+    assert review_module.browser_env({}, socket_glob=str(tmp_path / "X*"))["DISPLAY"] == ":0"
+
+
+def test_browser_env_leaves_display_unset_without_a_socket(tmp_path: Path):
+    assert "DISPLAY" not in review_module.browser_env({}, socket_glob=str(tmp_path / "X*"))
+
+
 def test_cdp_up_is_false_without_a_listener():
     assert review_module.cdp_up("http://127.0.0.1:9/json/version", timeout=0.5) is False
 

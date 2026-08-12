@@ -44,6 +44,7 @@ class Project:
 class Config:
     path: Path
     engine: EnginePin
+    defaults: dict[str, object]
     projects: dict[str, Project]
 
     def project(self, name: str) -> Project:
@@ -107,7 +108,7 @@ def load(path: Path) -> Config:
     projects = {}
     for name, table in project_tables.items():
         projects[name] = _project(name, table, defaults)
-    return Config(path=path, engine=engine, projects=projects)
+    return Config(path=path, engine=engine, defaults=defaults, projects=projects)
 
 
 def _project(name: str, table: object, defaults: dict[str, object]) -> Project:

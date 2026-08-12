@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import glob
 import json
+import os
 import subprocess
 import sys
 import urllib.error
@@ -14,6 +16,7 @@ from .config import Project
 
 CDP_URL = "http://127.0.0.1:9222/json/version"
 RESPONSE_GLOB = ".insane-review/response_*.md"
+X11_SOCKETS = "/tmp/.X11-unix/X*"
 
 
 @dataclass(frozen=True)
@@ -60,13 +63,30 @@ def cdp_up(url: str = CDP_URL, *, timeout: float = 3.0) -> bool:
     return True
 
 
-def ensure_browser(engine: Path, *, python: str | None = None, timeout: float = 90.0) -> str:
+def browser_env(env: dict[str, str] | None = None, *, socket_glob: str = X11_SOCKETS) -> dict[str, str]:
+    """Environment for launching the browser.
+
+    A shell started outside the desktop session (ssh, cron, an agent) has no
+    DISPLAY, and the engine's launcher then times out with no useful message.
+    Point it at the running X display when one exists.
+    """
+    resolved = dict(os.environ if env is None else env)
+    if resolved.get("DISPLAY"):
+        return resolved
+    sockets = sorted(glob.glob(socket_glob))
+    if sockets:
+        resolved["DISPLAY"] = ":" + Path(sockets[0]).name.lstrip("X")
+    return resolved
+
+
+def ensure_browser(engine: Path, *, python: str | None = None, timeout: float = 180.0) -> str:
     """Ask the engine to start the saved browser profile. Returns its STATUS line."""
     result = subprocess.run(
         [python or sys.executable, str(engine), "--ensure-env"],
         capture_output=True,
         text=True,
         timeout=timeout,
+        env=browser_env(),
     )
     for line in reversed((result.stdout + result.stderr).splitlines()):
         if line.startswith("STATUS "):
@@ -88,5 +108,6 @@ def newest_new_response(root: Path, before: set[Path]) -> Path | None:
 def run(engine: Path, project: Project, root: Path, prompt: str, *,
         include: tuple[str, ...] | None = None, python: str | None = None) -> ReviewOutcome:
     before = responses(root)
-    result = subprocess.run(command(engine, project, prompt, include=include, python=python), cwd=root)
+    result = subprocess.run(command(engine, project, prompt, include=include, python=python),
+                            cwd=root, env=browser_env())
     return ReviewOutcome(returncode=result.returncode, response=newest_new_response(root, before))
