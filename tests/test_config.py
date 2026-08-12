@@ -4,7 +4,15 @@ from pathlib import Path
 
 import pytest
 
-from lane.config import ConfigError, checked_root, find_config, load, secret_markers_in
+from lane.config import (
+    ConfigError,
+    assert_safe_pack,
+    checked_root,
+    find_config,
+    load,
+    secret_markers_in,
+    unsafe_pack_paths,
+)
 
 
 def test_defaults_apply_and_project_overrides_win(write_config):
@@ -38,7 +46,7 @@ def test_force_answer_after_must_stay_below_max_wait(write_config):
 def test_empty_include_is_rejected(lane_repo: Path, project_root: Path):
     path = lane_repo / "lane.toml"
     path.write_text(
-        '[engine]\nrepo = "r"\nsha = "s"\n\n[projects.demo]\n'
+        '[engine]\nrepo = "o/r"\nsha = "' + "a" * 40 + '"\n\n[projects.demo]\n'
         f'root = "{project_root.as_posix()}"\ninclude = []\n',
         encoding="utf-8",
     )
@@ -48,11 +56,22 @@ def test_empty_include_is_rejected(lane_repo: Path, project_root: Path):
 
 
 def test_engine_pin_builds_the_raw_url(write_config):
-    config = load(write_config(sha="abc123"))
+    sha = "0123456789abcdef" * 2 + "01234567"
+    config = load(write_config(sha=sha))
 
     assert config.engine.raw_url == (
-        "https://raw.githubusercontent.com/fivetaku/insane-review/abc123/bin/pack_and_ask.py"
+        f"https://raw.githubusercontent.com/fivetaku/insane-review/{sha}/bin/pack_and_ask.py"
     )
+
+
+def test_a_moving_ref_is_not_a_pin(write_config):
+    with pytest.raises(ConfigError, match="full 40-character commit hash"):
+        load(write_config(sha="main"))
+
+
+def test_a_sha_with_a_path_separator_is_rejected(write_config):
+    with pytest.raises(ConfigError, match="full 40-character commit hash"):
+        load(write_config(sha="../../etc/passwd"))
 
 
 def test_checked_root_refuses_a_root_holding_secrets(write_config, project_root: Path):
@@ -81,6 +100,50 @@ def test_secret_markers_cover_dotenv_variants_and_private_artifacts(project_root
     (project_root / "artifacts" / "private").mkdir(parents=True)
 
     assert secret_markers_in(project_root) == ["artifacts/private", ".env.production"]
+
+
+def test_a_nested_dotenv_is_caught_even_though_the_root_looks_clean(write_config, project_root: Path):
+    (project_root / "src" / ".env").write_text("TOKEN=x\n", encoding="utf-8")
+    project = load(write_config()).project("demo")
+
+    assert checked_root(project) == project_root, "the root scan cannot see it"
+    with pytest.raises(ConfigError, match=r"src/\.env: secret-like name"):
+        assert_safe_pack(project, project_root, ("src/**/*",))
+
+
+def test_dotenv_variants_and_private_keys_are_caught(project_root: Path):
+    (project_root / "src" / ".envrc").write_text("x\n", encoding="utf-8")
+    (project_root / "src" / ".ENV").write_text("x\n", encoding="utf-8")
+    (project_root / "src" / "id_ed25519").write_text("x\n", encoding="utf-8")
+    (project_root / "src" / "server.pem").write_text("x\n", encoding="utf-8")
+
+    problems = unsafe_pack_paths(project_root, ("src/*",))
+
+    assert {problem.split(":")[0] for problem in problems} == {
+        "src/.envrc", "src/.ENV", "src/id_ed25519", "src/server.pem",
+    }
+
+
+def test_private_artifacts_are_caught_at_any_depth(project_root: Path):
+    private = project_root / "artifacts" / "private"
+    private.mkdir(parents=True)
+    (private / "memory.sqlite3").write_text("x\n", encoding="utf-8")
+
+    assert unsafe_pack_paths(project_root, ("artifacts/**/*",)) == [
+        "artifacts/private/memory.sqlite3: private artifact"
+    ]
+
+
+def test_a_symlink_out_of_the_root_is_refused(project_root: Path, tmp_path: Path):
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret\n", encoding="utf-8")
+    (project_root / "src" / "link.py").symlink_to(outside)
+
+    assert unsafe_pack_paths(project_root, ("src/*.py",)) == ["src/link.py: symlinked"]
+
+
+def test_ordinary_sources_are_not_flagged(project_root: Path):
+    assert unsafe_pack_paths(project_root, ("src/**/*.py",)) == []
 
 
 def test_find_config_walks_upwards(lane_repo: Path, write_config):

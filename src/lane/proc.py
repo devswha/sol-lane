@@ -2,19 +2,27 @@
 
 Every child this package spawns holds something expensive: the browser, a Sol
 Pro message in flight, or a gate run. If the caller is interrupted and the child
-is left behind, that spend continues with nobody to receive the result — which
-is exactly what happened when a `lane review` parent was killed and the engine
-kept driving the browser for another ten minutes.
+is left behind, that spend continues with nobody to receive the result.
+
+Killing the direct child is not enough: gates run under a shell and engines
+start browsers, so the process is put in its own session and the whole group is
+signalled.
 """
 
 from __future__ import annotations
 
+import os
 import signal
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
 TERMINATE_GRACE_SECONDS = 10.0
+
+# A gate inherits nothing it was not given: its output is fed back into the next
+# Sol Pro prompt, so an inherited token can leave the machine through a stack
+# trace. LC_* and anything the operator names explicitly are added on top.
+GATE_ENV_KEYS = ("HOME", "LANG", "PATH", "TERM", "TZ", "USER")
 
 
 @dataclass(frozen=True)
@@ -32,12 +40,22 @@ class Completed:
         return lines[-1] if lines else "no detail"
 
 
+def sanitized_env(extra_keys: tuple[str, ...] = ()) -> dict[str, str]:
+    """Environment for an untrusted child whose output is forwarded onward."""
+    keys = set(GATE_ENV_KEYS) | set(extra_keys)
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if key in keys or key.startswith("LC_")
+    }
+
+
 def run(command: list[str] | str, *, cwd: Path | None = None, env: dict[str, str] | None = None,
         timeout: float | None = None, shell: bool = False, capture: bool = True) -> Completed:
-    """Run *command* to completion, terminating it if anything interrupts us."""
+    """Run *command* to completion, terminating its process group on interruption."""
     pipe = subprocess.PIPE if capture else None
     with subprocess.Popen(command, cwd=cwd, env=env, shell=shell, text=True,
-                          stdout=pipe, stderr=pipe) as process:
+                          stdout=pipe, stderr=pipe, start_new_session=True) as process:
         try:
             stdout, stderr = process.communicate(timeout=timeout)
         except BaseException:  # timeout, SIGINT, SIGTERM-turned-SystemExit
@@ -47,12 +65,25 @@ def run(command: list[str] | str, *, cwd: Path | None = None, env: dict[str, str
 
 
 def _stop(process: subprocess.Popen) -> None:
-    process.terminate()
+    _signal_group(process, signal.SIGTERM)
     try:
         process.wait(TERMINATE_GRACE_SECONDS)
     except subprocess.TimeoutExpired:
-        process.kill()
+        _signal_group(process, signal.SIGKILL)
         process.wait()
+
+
+def _signal_group(process: subprocess.Popen, sig: int) -> None:
+    """Signal the child's whole session; fall back to the child alone."""
+    try:
+        os.killpg(os.getpgid(process.pid), sig)
+        return
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    try:
+        process.send_signal(sig)
+    except ProcessLookupError:
+        pass
 
 
 def exit_on_sigterm() -> None:

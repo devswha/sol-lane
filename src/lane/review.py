@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import proc
-from .config import Project
+from .config import Project, assert_safe_pack
 
 class ReviewError(Exception):
     """The engine did not deliver a verified answer. Maps to exit code 1."""
@@ -117,15 +117,33 @@ def responses(root: Path) -> set[Path]:
 
 
 def newest_new_response(root: Path, before: set[Path]) -> Path | None:
-    created = responses(root) - before
+    """The newest response this run produced, or None.
+
+    A path appearing is not a delivery: an empty file, a directory, or an
+    unreadable blob must not be reported as a verified answer.
+    """
+    created = [path for path in responses(root) - before if _is_answer(path)]
     if not created:
         return None
     return max(created, key=lambda path: path.stat().st_mtime)
 
 
+def _is_answer(path: Path) -> bool:
+    if not path.is_file() or path.stat().st_size == 0:
+        return False
+    try:
+        return bool(path.read_text(encoding="utf-8").strip())
+    except (OSError, UnicodeDecodeError):
+        return False
+
+
 def ask(engine: Path, project: Project, root: Path, prompt: str, *,
         include: tuple[str, ...] | None = None, python: str | None = None) -> str:
     """Pack the project, ask Sol Pro, and return the answer as text."""
+    globs = include or project.include
+    # Re-checked on every call: a drive iteration can create a secret file
+    # between the start of the loop and the next planning request.
+    assert_safe_pack(project, root, globs)
     council = command(engine, project, prompt, include=include, python=python, council=True)
     try:
         result = proc.run(council, cwd=root, env=browser_env(), timeout=project.max_wait + 300)
@@ -141,6 +159,7 @@ def ask(engine: Path, project: Project, root: Path, prompt: str, *,
 
 def run(engine: Path, project: Project, root: Path, prompt: str, *,
         include: tuple[str, ...] | None = None, python: str | None = None) -> ReviewOutcome:
+    assert_safe_pack(project, root, include or project.include)
     before = responses(root)
     result = proc.run(command(engine, project, prompt, include=include, python=python),
                       cwd=root, env=browser_env(), capture=False)

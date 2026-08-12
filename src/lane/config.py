@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import re
 import tomllib
+from fnmatch import fnmatch
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -11,6 +13,20 @@ CONFIG_NAME = "lane.toml"
 # A packed context leaves this machine. A root holding any of these is the
 # wrong root — the lane refuses it instead of trusting a downstream filter.
 SECRET_MARKERS = (".env", "id_rsa", "id_ed25519", "artifacts/private")
+
+# Checking the root's top level is a fast smell test, not a guarantee: the pack
+# is built from include globs, which can reach a nested .env or follow a symlink
+# out of the tree. Every file that is actually going to be packed is matched
+# against these, case-insensitively, on every path component.
+SECRET_NAME_PATTERNS = (
+    ".env", ".env.*", ".env-*", ".envrc", ".netrc", ".npmrc", ".pypirc",
+    "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519",
+    "*.pem", "*.key", "*.p12", "*.pfx", "credentials.json", "secrets.*",
+)
+SECRET_DIR_PREFIXES = ("artifacts/private",)
+
+_REPO_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 
 
 class ConfigError(Exception):
@@ -85,6 +101,57 @@ def secret_markers_in(root: Path) -> list[str]:
     return found
 
 
+def _matches_secret_name(name: str) -> bool:
+    lowered = name.lower()
+    return any(fnmatch(lowered, pattern) for pattern in SECRET_NAME_PATTERNS)
+
+
+def unsafe_pack_paths(root: Path, globs: tuple[str, ...]) -> list[str]:
+    """Reasons the include globs must not be packed, as `path: reason` lines.
+
+    The pack is what actually leaves the machine, so this — not the root scan —
+    is the load-bearing check.
+    """
+    resolved_root = root.resolve()
+    problems: set[str] = set()
+    for pattern in globs:
+        for path in root.glob(pattern):
+            if not path.is_file():
+                continue
+            relative = path.relative_to(root)
+            if _has_symlink_component(root, relative):
+                problems.add(f"{relative}: symlinked")
+                continue
+            if not path.resolve().is_relative_to(resolved_root):
+                problems.add(f"{relative}: resolves outside the root")
+                continue
+            posix = relative.as_posix().lower()
+            if any(posix.startswith(prefix) for prefix in SECRET_DIR_PREFIXES):
+                problems.add(f"{relative}: private artifact")
+            elif any(_matches_secret_name(part) for part in relative.parts):
+                problems.add(f"{relative}: secret-like name")
+    return sorted(problems)
+
+
+def _has_symlink_component(root: Path, relative: Path) -> bool:
+    current = root
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            return True
+    return False
+
+
+def assert_safe_pack(project: Project, root: Path, globs: tuple[str, ...]) -> None:
+    """Fail closed before anything is packed and sent."""
+    problems = unsafe_pack_paths(root, globs)
+    if problems:
+        raise ConfigError(
+            f"[projects.{project.name}] refusing to pack: " + "; ".join(problems[:5])
+            + (f" (+{len(problems) - 5} more)" if len(problems) > 5 else "")
+        )
+
+
 def load(path: Path) -> Config:
     try:
         raw = tomllib.loads(path.read_text(encoding="utf-8"))
@@ -94,7 +161,14 @@ def load(path: Path) -> Config:
     engine_table = raw.get("engine")
     if not isinstance(engine_table, dict) or not engine_table.get("repo") or not engine_table.get("sha"):
         raise ConfigError("[engine] requires both repo and sha")
-    engine = EnginePin(repo=str(engine_table["repo"]), sha=str(engine_table["sha"]))
+    repo, sha = str(engine_table["repo"]), str(engine_table["sha"])
+    if not _REPO_PATTERN.match(repo):
+        raise ConfigError("[engine] repo must be owner/name")
+    if not _SHA_PATTERN.match(sha):
+        # A branch name is a moving target and a path separator escapes the
+        # cache directory; a pin has to be a pin.
+        raise ConfigError("[engine] sha must be a full 40-character commit hash")
+    engine = EnginePin(repo=repo, sha=sha)
 
     defaults = dict(_DEFAULTS)
     for key, value in (raw.get("defaults") or {}).items():
