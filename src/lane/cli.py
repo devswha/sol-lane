@@ -144,8 +144,17 @@ def _engine_sync(config: Config, *, refresh: bool) -> int:
     return EXIT_OK
 
 
+LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
+
+
 def _serve(config: Config, args: argparse.Namespace) -> int:
     engine_path = engine_module.resolve(_repo_root(config), override=os.environ.get("LANE_ENGINE"))
+    token = os.environ.get("SOL_PRO_LOCAL_KEY", "").strip() or None
+    if token is None and args.host not in LOOPBACK_HOSTS:
+        raise ConfigError(
+            f"refusing to bind {args.host} without SOL_PRO_LOCAL_KEY: every request "
+            "spends a subscription message"
+        )
     defaults = config.defaults
     settings = serve_module.ServeSettings(
         engine=engine_path,
@@ -157,6 +166,7 @@ def _serve(config: Config, args: argparse.Namespace) -> int:
             if args.force_answer_after is not None
             else int(defaults["force_answer_after"])
         ),
+        token=token,
     )
     if not review_module.cdp_up():
         status = review_module.ensure_browser(engine_path)
@@ -192,6 +202,9 @@ def _drive(config: Config, args: argparse.Namespace) -> int:
         implementer=lambda plan, first: drive_module.implement(root, plan, first=first, session=args.session),
         gate_runner=lambda: drive_module.run_gate(root, project.gate),
     )
+    if outcome.already_satisfied:
+        print("verdict    gate already passes; no work was requested and no message was spent")
+        return EXIT_OK
     print(f"verdict    {'PASS' if outcome.passed else 'FAIL'} after {outcome.iterations} attempt(s)")
     if not outcome.passed:
         print(f"plan       {root / drive_module.PLAN_RELPATH}")

@@ -235,6 +235,90 @@ def stub_engine(monkeypatch, returncode, stdout="", stderr=""):
     monkeypatch.setattr(serve_module.proc, "run", lambda *a, **k: completed)
 
 
+def test_a_token_is_required_when_configured():
+    settings = dataclasses.replace(SETTINGS, token="secret-token")
+    with running(lambda s, p: "hello", settings) as url:
+        with pytest.raises(urllib.error.HTTPError) as caught:
+            post(f"{url}/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}]})
+        assert caught.value.code == 401
+
+        request = urllib.request.Request(
+            f"{url}/v1/chat/completions",
+            data=json.dumps({"messages": [{"role": "user", "content": "hi"}]}).encode(),
+            headers={"content-type": "application/json", "authorization": "Bearer secret-token"},
+        )
+        payload = json.loads(urllib.request.urlopen(request, timeout=10).read())
+    assert payload["choices"][0]["message"]["content"] == "hello"
+
+
+def test_a_wrong_token_is_refused_on_model_listing():
+    settings = dataclasses.replace(SETTINGS, token="secret-token")
+    with running(lambda s, p: "hello", settings) as url:
+        request = urllib.request.Request(f"{url}/v1/models", headers={"authorization": "Bearer nope"})
+        with pytest.raises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(request, timeout=10)
+    assert caught.value.code == 401
+
+
+def test_tool_definitions_are_refused_instead_of_silently_dropped(server):
+    with pytest.raises(urllib.error.HTTPError) as caught:
+        post(f"{server}/v1/chat/completions", {
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "read"}}],
+        })
+
+    assert caught.value.code == 400
+    assert "--no-tools" in json.loads(caught.value.read())["error"]["message"]
+
+
+def test_an_empty_tools_array_still_works(server):
+    response = post(f"{server}/v1/chat/completions",
+                    {"messages": [{"role": "user", "content": "hi"}], "tools": []})
+
+    assert json.loads(response.read())["choices"][0]["message"]["content"] == "hello"
+
+
+def test_non_text_content_parts_are_refused(server):
+    with pytest.raises(urllib.error.HTTPError) as caught:
+        post(f"{server}/v1/chat/completions", {
+            "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {}}]}],
+        })
+
+    assert caught.value.code == 400
+
+
+def test_a_queued_request_whose_client_left_never_spends_a_message():
+    """The expensive part must start only after the browser is actually free."""
+    settings = dataclasses.replace(SETTINGS, heartbeat_seconds=0.05)
+    started = threading.Semaphore(0)
+    release = threading.Event()
+    calls = []
+
+    def runner(_settings, prompt):
+        calls.append(prompt)
+        started.release()
+        release.wait(10)
+        return "first answer"
+
+    with running(runner, settings) as url:
+        holder = threading.Thread(target=lambda: post(
+            f"{url}/v1/chat/completions",
+            {"stream": True, "messages": [{"role": "user", "content": "first"}]}).read(), daemon=True)
+        holder.start()
+        assert started.acquire(timeout=10), "the first request never reached the engine"
+
+        queued = post(f"{url}/v1/chat/completions",
+                      {"stream": True, "messages": [{"role": "user", "content": "second"}]})
+        queued.read(1)          # a heartbeat proves the handler is alive and waiting
+        queued.close()          # ...and then the client leaves
+        time.sleep(0.4)
+
+        release.set()
+        holder.join(10)
+
+    assert calls == [calls[0]], f"the abandoned request still ran the engine: {len(calls)} calls"
+
+
 def test_run_engine_reports_a_non_zero_exit(monkeypatch):
     stub_engine(monkeypatch, 3, stderr="boom")
 

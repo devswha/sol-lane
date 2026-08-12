@@ -51,15 +51,22 @@ def clipboard_command() -> tuple[str, ...] | None:
 def bundle(project: Project, root: Path, *, include: tuple[str, ...] | None = None) -> PasteOutcome:
     if not shutil.which("codexpro"):
         raise PasteError("codexpro is not installed; `npm install -g codexpro`")
+
+    path = root / BUNDLE_RELPATH
+    # A leftover bundle would let a silently failing run copy stale context.
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as error:
+        raise PasteError(f"cannot clear the previous bundle at {path}: {error}") from error
+
     result = subprocess.run(bundle_command(project, root, include=include), cwd=root,
                             capture_output=True, text=True)
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip().splitlines()
         raise PasteError(f"pro-bundle failed: {detail[-1] if detail else 'unknown failure'}")
 
-    path = root / BUNDLE_RELPATH
-    if not path.is_file():
-        raise PasteError(f"pro-bundle reported success but wrote no {BUNDLE_RELPATH}")
+    if not path.is_file() or not path.read_text(encoding="utf-8", errors="replace").strip():
+        raise PasteError(f"pro-bundle reported success but wrote no usable {BUNDLE_RELPATH}")
 
     command = clipboard_command()
     if command is None:

@@ -11,11 +11,20 @@ The gate is authoritative. Pro proposes; the tests decide.
 
 from __future__ import annotations
 
+import hashlib
+import os
 import subprocess
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
 from . import proc
+
+# Lane-owned and machine-generated paths change on every run; they must not
+# count as "the implementation did something".
+FINGERPRINT_IGNORED = (".git", ".ai-bridge", ".insane-review", ".venv", "__pycache__", ".pytest_cache")
+# Redacting shorter values would turn ordinary words into noise.
+MIN_REDACTED_SECRET = 8
 
 PLAN_RELPATH = ".ai-bridge/current-plan.md"
 SESSION_RELPATH = ".ai-bridge/lane-session"
@@ -68,6 +77,7 @@ class Attempt:
 class DriveOutcome:
     passed: bool
     attempts: tuple[Attempt, ...]
+    already_satisfied: bool = False
 
     @property
     def iterations(self) -> int:
@@ -116,31 +126,80 @@ def implement(root: Path, plan: Path, *, first: bool, session: str | None = None
     return result.stdout.strip()
 
 
-def run_gate(root: Path, gate: str) -> tuple[bool, str]:
-    """Run the repository's own gate. Its exit code is the verdict."""
+def run_gate(root: Path, gate: str, *, env: Mapping[str, str] | None = None) -> tuple[bool, str]:
+    """Run the repository's own gate. Its exit code is the verdict.
+
+    The environment is an allowlist because this output is forwarded to Sol Pro
+    in the retry prompt, and anything still recognisable as a live secret is
+    redacted before it can travel.
+    """
+    environment = dict(env) if env is not None else proc.sanitized_env()
     try:
-        result = proc.run(gate, cwd=root, shell=True)
+        result = proc.run(gate, cwd=root, shell=True, env=environment)
     except (OSError, subprocess.SubprocessError) as error:
         raise DriveError(f"gate could not run: {error}") from error
-    return result.returncode == 0, result.output[-GATE_LOG_LIMIT:]
+    redacted, _ = redact_secrets(result.output[-GATE_LOG_LIMIT:])
+    return result.returncode == 0, redacted
+
+
+def redact_secrets(text: str, env: Mapping[str, str] | None = None) -> tuple[str, int]:
+    """Replace live environment values with their variable name."""
+    source = os.environ if env is None else env
+    redacted, hits = text, 0
+    for key, value in source.items():
+        if not value or len(value) < MIN_REDACTED_SECRET or value not in redacted:
+            continue
+        redacted = redacted.replace(value, f"<redacted:{key}>")
+        hits += 1
+    return redacted, hits
+
+
+def worktree_fingerprint(root: Path, *, ignored: tuple[str, ...] = FINGERPRINT_IGNORED) -> str:
+    """Cheap identity of the tree, used to detect an implementation that did nothing."""
+    digest = hashlib.sha256()
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root)
+        if any(part in ignored for part in relative.parts):
+            continue
+        if path.is_symlink() or not path.is_file():
+            digest.update(f"{relative}\0node\0".encode())
+            continue
+        info = path.stat()
+        digest.update(f"{relative}\0{info.st_size}\0{info.st_mtime_ns}\0".encode())
+    return digest.hexdigest()
 
 
 def drive(root: Path, intent: str, gate: str, *, max_iters: int, planner, implementer, gate_runner,
-          log=print) -> DriveOutcome:
+          log=print, fingerprint=worktree_fingerprint) -> DriveOutcome:
     """One planning consultation per attempt; the gate ends the loop."""
     if max_iters < 1:
         raise DriveError("max_iters must be at least 1")
+
+    # A gate that is already green cannot distinguish a working implementation
+    # from one that changed nothing, so establish that it is red first.
+    log(f"[0/{max_iters}] gate before any work: {gate}")
+    if gate_runner()[0]:
+        log(f"[0/{max_iters}] gate already passes — nothing to drive")
+        return DriveOutcome(passed=True, attempts=(), already_satisfied=True)
 
     attempts: list[Attempt] = []
     failure: str | None = None
     for iteration in range(1, max_iters + 1):
         log(f"[{iteration}/{max_iters}] asking Sol Pro for a plan")
         plan_text = planner(plan_request(intent, gate=gate, failure=failure))
+        if not isinstance(plan_text, str) or not plan_text.strip():
+            raise DriveError("planner returned an empty plan")
         plan_path = write_plan(root, plan_text)
         log(f"[{iteration}/{max_iters}] plan {len(plan_text)} chars -> {plan_path}")
 
         log(f"[{iteration}/{max_iters}] implementing with gjc")
+        before = fingerprint(root)
         implementer(plan_path, iteration == 1)
+        if fingerprint(root) == before:
+            raise DriveError(
+                "implementation produced no repository change; "
+                "a gate verdict now would describe the previous state"
+            )
 
         log(f"[{iteration}/{max_iters}] gate: {gate}")
         passed, output = gate_runner()

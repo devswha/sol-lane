@@ -112,6 +112,15 @@ def test_drive_without_a_gate_is_refused(write_config, lane_repo: Path, capsys):
     assert "needs a gate command" in capsys.readouterr().err
 
 
+def test_serve_refuses_a_public_bind_without_a_token(write_config, lane_repo: Path, capsys, monkeypatch):
+    config = write_config()
+    vendored_engine(lane_repo)
+    monkeypatch.delenv("SOL_PRO_LOCAL_KEY", raising=False)
+
+    assert cli.main(["--config", str(config), "serve", "--host", "0.0.0.0"]) == cli.EXIT_CONFIG
+    assert "spends a subscription message" in capsys.readouterr().err
+
+
 def test_missing_config_is_a_config_error(tmp_path: Path, capsys):
     assert cli.main(["--config", str(tmp_path / "nope.toml"), "projects"]) == cli.EXIT_CONFIG
     assert "cannot read" in capsys.readouterr().err

@@ -14,6 +14,7 @@ every Sol Pro constraint is enforced:
 
 from __future__ import annotations
 
+import hmac
 import json
 import subprocess
 import sys
@@ -46,6 +47,9 @@ class ServeSettings:
     max_wait: int = 1200
     force_answer_after: int = 0
     python: str | None = None
+    # Without a token the endpoint is only safe on loopback: every request spends
+    # a subscription message, so anyone who can reach the port can spend them.
+    token: str | None = None
     # Pro reasons for minutes, and gjc aborts a stream whose first *event* has
     # not arrived within retry.streamFirstEventTimeoutMs (100s by default),
     # then retries — spending another Pro message on the same question. SSE
@@ -78,6 +82,27 @@ def text_of(content: object) -> str:
                 parts.append(part["text"])
         return "\n".join(parts)
     return ""
+
+
+def unsupported_request(request: dict) -> str | None:
+    """Why this request cannot be served honestly, if it cannot.
+
+    Silently dropping tool definitions produces a model that looks like it
+    chose not to call a tool, when it never saw one.
+    """
+    tools = request.get("tools")
+    if isinstance(tools, list) and tools:
+        return ("tool calling is not bridged to Sol Pro yet; "
+                "run gjc with --no-tools or use a tool-capable model")
+    for message in request.get("messages") or []:
+        if message.get("tool_calls") or message.get("tool_call_id"):
+            return "tool results cannot be replayed to Sol Pro yet"
+        content = message.get("content")
+        if isinstance(content, list) and any(
+            not (isinstance(part, dict) and isinstance(part.get("text"), str)) for part in content
+        ):
+            return "only text content parts are supported"
+    return None
 
 
 def render_prompt(messages: list[dict]) -> str:
@@ -165,14 +190,21 @@ def make_handler(settings: ServeSettings, *, runner=run_engine, lock=None, log=p
 
         def do_POST(self):
             length = int(self.headers.get("content-length", "0"))
+            body = self.rfile.read(length) or b"{}"
+            if not self._authorized():
+                return self._error(401, "missing or invalid bearer token")
             try:
-                request = json.loads(self.rfile.read(length) or b"{}")
+                request = json.loads(body)
             except ValueError:
                 return self._error(400, "request body is not JSON")
 
             messages = request.get("messages") or []
             if not isinstance(messages, list) or not messages:
                 return self._error(400, "messages must be a non-empty array")
+            refusal = unsupported_request(request)
+            if refusal is not None:
+                log(f"!! refused: {refusal}")
+                return self._error(400, refusal)
             prompt = render_prompt(messages)
             model = str(request.get("model", settings.model))
 
@@ -192,7 +224,16 @@ def make_handler(settings: ServeSettings, *, runner=run_engine, lock=None, log=p
             return self._json(200, completion_payload(model, answer, prompt, delta=False))
 
         def do_GET(self):
+            if not self._authorized():
+                return self._error(401, "missing or invalid bearer token")
             self._json(200, {"object": "list", "data": [{"id": settings.model, "object": "model"}]})
+
+        def _authorized(self) -> bool:
+            if settings.token is None:
+                return True
+            header = self.headers.get("authorization", "")
+            presented = header[7:].strip() if header[:7].lower() == "bearer " else ""
+            return hmac.compare_digest(presented, settings.token)
 
         def _json(self, status: int, payload: dict):
             body = json.dumps(payload).encode()
@@ -213,25 +254,35 @@ def make_handler(settings: ServeSettings, *, runner=run_engine, lock=None, log=p
             self.send_header("connection", "close")
             self.end_headers()
 
+            if not self._write(heartbeat_frame(model)):
+                return
+            # Take the browser before starting anything: a request that queues
+            # behind another one and then loses its client must not wake up
+            # later and spend a Pro message for nobody.
+            if not self._acquire(model):
+                log("!! client hung up while queued; engine never started")
+                return
+
             outcome: dict = {}
 
             def work():
-                with guard:  # one browser, one conversation
-                    try:
-                        outcome["answer"] = runner(settings, prompt)
-                    except ServeError as error:
-                        outcome["error"] = str(error)
+                try:
+                    outcome["answer"] = runner(settings, prompt)
+                except ServeError as error:
+                    outcome["error"] = str(error)
 
             worker = threading.Thread(target=work, daemon=True)
             worker.start()
-            if not self._write(heartbeat_frame(model)):
-                return
-            while True:
-                worker.join(timeout=settings.heartbeat_seconds)
-                if not worker.is_alive():
-                    break
-                if not self._write(heartbeat_frame(model)):
-                    return  # client hung up; the worker finishes and is discarded
+            try:
+                while True:
+                    worker.join(timeout=settings.heartbeat_seconds)
+                    if not worker.is_alive():
+                        break
+                    if not self._write(heartbeat_frame(model)):
+                        worker.join()  # the message is already in flight; do not abandon the lock
+                        return
+            finally:
+                guard.release()
 
             if "error" in outcome:
                 log(f"!! {outcome['error']}")
@@ -245,6 +296,13 @@ def make_handler(settings: ServeSettings, *, runner=run_engine, lock=None, log=p
             for frame in sse_frames(model, answer, prompt):
                 if not self._write(frame):
                     return
+
+        def _acquire(self, model: str) -> bool:
+            """Hold the stream open with heartbeats until the browser is free."""
+            while not guard.acquire(timeout=settings.heartbeat_seconds):
+                if not self._write(heartbeat_frame(model)):
+                    return False
+            return True
 
         def _write(self, payload: bytes) -> bool:
             """Write to the client, reporting a hang-up instead of raising."""
