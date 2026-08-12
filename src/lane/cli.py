@@ -16,7 +16,7 @@ from pathlib import Path
 
 from . import drive as drive_module
 from . import engine as engine_module
-from . import proc
+from . import locks, proc
 from . import paste as paste_module
 from . import review as review_module
 from . import serve as serve_module
@@ -82,7 +82,8 @@ def main(argv: list[str] | None = None) -> int:
     except (ConfigError, engine_module.EngineError) as error:
         print(f"lane: {error}", file=sys.stderr)
         return EXIT_CONFIG
-    except (paste_module.PasteError, review_module.ReviewError, drive_module.DriveError) as error:
+    except (paste_module.PasteError, review_module.ReviewError, drive_module.DriveError,
+            locks.LockBusy) as error:
         print(f"lane: {error}", file=sys.stderr)
         return EXIT_DELIVERY
 
@@ -94,6 +95,11 @@ def _load_config(explicit: str | None) -> Config:
 
 def _repo_root(config: Config) -> Path:
     return config.path.parent
+
+
+def _engine(config: Config) -> Path:
+    return engine_module.resolve(_repo_root(config), override=os.environ.get("LANE_ENGINE"),
+                                 pin=config.engine)
 
 
 def _projects(config: Config) -> int:
@@ -109,7 +115,8 @@ def _doctor(config: Config) -> int:
     problems = 0
 
     try:
-        engine_path = engine_module.resolve(root, override=os.environ.get("LANE_ENGINE"))
+        engine_path = engine_module.resolve(root, override=os.environ.get("LANE_ENGINE"),
+                                            pin=config.engine)
         print(f"engine     ok       {engine_path}")
     except engine_module.EngineError as error:
         print(f"engine     missing  {error}")
@@ -148,7 +155,7 @@ LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
 
 
 def _serve(config: Config, args: argparse.Namespace) -> int:
-    engine_path = engine_module.resolve(_repo_root(config), override=os.environ.get("LANE_ENGINE"))
+    engine_path = _engine(config)
     token = os.environ.get("SOL_PRO_LOCAL_KEY", "").strip() or None
     if token is None and args.host not in LOOPBACK_HOSTS:
         raise ConfigError(
@@ -183,7 +190,7 @@ def _drive(config: Config, args: argparse.Namespace) -> int:
     if not project.gate:
         raise ConfigError(f"[projects.{project.name}] needs a gate command for `lane drive`")
     include = _globs(args.include)
-    engine_path = engine_module.resolve(_repo_root(config), override=os.environ.get("LANE_ENGINE"))
+    engine_path = _engine(config)
 
     if args.dry_run:
         plan = root / drive_module.PLAN_RELPATH
@@ -193,15 +200,10 @@ def _drive(config: Config, args: argparse.Namespace) -> int:
         print(project.gate)
         return EXIT_OK
 
-    outcome = drive_module.drive(
-        root,
-        args.intent,
-        project.gate,
-        max_iters=args.max_iters,
-        planner=lambda prompt: review_module.ask(engine_path, project, root, prompt, include=include),
-        implementer=lambda plan, first: drive_module.implement(root, plan, first=first, session=args.session),
-        gate_runner=lambda: drive_module.run_gate(root, project.gate),
-    )
+    # One plan file, one gjc session directory, one worktree: two drives in the
+    # same root would execute each other's plans.
+    with locks.exclusive(root / ".ai-bridge" / "drive.lock", timeout=0):
+        outcome = _drive_loop(config, args, project, root, include, engine_path)
     if outcome.already_satisfied:
         print("verdict    gate already passes; no work was requested and no message was spent")
         return EXIT_OK
@@ -210,6 +212,18 @@ def _drive(config: Config, args: argparse.Namespace) -> int:
         print(f"plan       {root / drive_module.PLAN_RELPATH}")
         return EXIT_DELIVERY
     return EXIT_OK
+
+
+def _drive_loop(config: Config, args, project, root: Path, include, engine_path: Path):
+    return drive_module.drive(
+        root,
+        args.intent,
+        project.gate,
+        max_iters=args.max_iters,
+        planner=lambda prompt: review_module.ask(engine_path, project, root, prompt, include=include),
+        implementer=lambda plan, first: drive_module.implement(root, plan, first=first, session=args.session),
+        gate_runner=lambda: drive_module.run_gate(root, project.gate),
+    )
 
 
 def _report_pack_size(root: Path, globs: tuple[str, ...]) -> None:
@@ -245,7 +259,7 @@ def _review(config: Config, args: argparse.Namespace) -> int:
               f"{root} --stdin   # after Pro answers")
         return EXIT_OK
 
-    engine_path = engine_module.resolve(_repo_root(config), override=os.environ.get("LANE_ENGINE"))
+    engine_path = _engine(config)
     if args.dry_run:
         print(" ".join(review_module.command(engine_path, project, args.prompt, include=include)))
         return EXIT_OK

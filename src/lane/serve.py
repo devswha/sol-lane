@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from . import proc
+from . import locks, proc
 from .review import browser_env
 
 ROLE_LABELS = {"system": "SYSTEM", "user": "USER", "assistant": "ASSISTANT", "tool": "TOOL"}
@@ -125,8 +125,9 @@ def estimate_tokens(text: str) -> int:
 
 def run_engine(settings: ServeSettings, prompt: str) -> str:
     try:
-        result = proc.run(settings.command(prompt), timeout=settings.max_wait + 120,
-                          env=browser_env())
+        with locks.exclusive(locks.browser_lock_path()):
+            result = proc.run(settings.command(prompt), timeout=settings.max_wait + 120,
+                              env=browser_env())
     except (OSError, subprocess.SubprocessError) as error:
         raise ServeError(f"engine could not run: {error}") from error
     if result.returncode != 0:

@@ -87,9 +87,66 @@ def test_sync_without_patches_reproduces_upstream(lane_repo: Path, monkeypatch):
     assert result.engine.read_text(encoding="utf-8") == "VALUE = 1\n"
 
 
-def test_sync_leaves_no_staging_file_behind(lane_repo: Path, monkeypatch):
+def test_sync_leaves_no_staging_artifacts_behind(lane_repo: Path, tmp_path: Path, monkeypatch):
+    """patch leaves .orig/.rej next to its target, so staging happens in a
+    throwaway directory rather than beside the published engine."""
     stage_upstream(lane_repo, "VALUE = 1\n", monkeypatch)
+    patch = lane_repo / "vendor" / "patches" / "0001-first.patch"
+    patch.write_text(make_patch("VALUE = 1\n", "VALUE = 2\n", tmp_path), encoding="utf-8")
 
     engine_module.sync(lane_repo, PIN)
 
-    assert list(engine_module.vendor_dir(lane_repo).glob("*.staged")) == []
+    leftovers = [
+        path.name
+        for path in engine_module.vendor_dir(lane_repo).iterdir()
+        if path.name not in {"pack_and_ask.py", "engine.json", "patches", ".upstream",
+                             ".engine-sync.lock"}
+    ]
+    assert leftovers == []
+
+
+def test_sync_records_a_manifest_that_resolve_verifies(lane_repo: Path, tmp_path: Path, monkeypatch):
+    stage_upstream(lane_repo, "VALUE = 1\n", monkeypatch)
+    patch = lane_repo / "vendor" / "patches" / "0001-first.patch"
+    patch.write_text(make_patch("VALUE = 1\n", "VALUE = 2\n", tmp_path), encoding="utf-8")
+
+    engine_module.sync(lane_repo, PIN)
+
+    assert engine_module.resolve(lane_repo, pin=PIN) == engine_module.engine_path(lane_repo)
+
+
+def test_an_engine_left_over_from_another_pin_is_refused(lane_repo: Path, monkeypatch):
+    """A failed pin bump leaves the previous engine on disk; running it would
+    review with the wrong tool while reporting success."""
+    stage_upstream(lane_repo, "VALUE = 1\n", monkeypatch)
+    engine_module.sync(lane_repo, PIN)
+
+    other = EnginePin(repo=PIN.repo, sha="b" * 40)
+    with pytest.raises(engine_module.EngineError, match="not the configured pin"):
+        engine_module.resolve(lane_repo, pin=other)
+
+
+def test_a_tampered_engine_is_refused(lane_repo: Path, monkeypatch):
+    stage_upstream(lane_repo, "VALUE = 1\n", monkeypatch)
+    engine_module.sync(lane_repo, PIN)
+    engine_module.engine_path(lane_repo).write_text("VALUE = 99\n", encoding="utf-8")
+
+    with pytest.raises(engine_module.EngineError, match="does not match its manifest"):
+        engine_module.resolve(lane_repo, pin=PIN)
+
+
+def test_changed_patches_invalidate_the_vendored_engine(lane_repo: Path, tmp_path: Path, monkeypatch):
+    stage_upstream(lane_repo, "VALUE = 1\n", monkeypatch)
+    engine_module.sync(lane_repo, PIN)
+    (lane_repo / "vendor" / "patches" / "0001-late.patch").write_text(
+        make_patch("VALUE = 1\n", "VALUE = 3\n", tmp_path), encoding="utf-8")
+
+    with pytest.raises(engine_module.EngineError, match="patches changed"):
+        engine_module.resolve(lane_repo, pin=PIN)
+
+
+def test_an_empty_upstream_is_refused(lane_repo: Path, monkeypatch):
+    stage_upstream(lane_repo, "\n", monkeypatch)
+
+    with pytest.raises(engine_module.EngineError, match="engine is empty"):
+        engine_module.sync(lane_repo, PIN)

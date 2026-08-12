@@ -1,14 +1,25 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from lane import cli
 from lane import engine as engine_module
 
 
-def vendored_engine(lane_repo: Path) -> Path:
+def vendored_engine(lane_repo: Path, sha: str = "deadbeef" * 5) -> Path:
     path = engine_module.engine_path(lane_repo)
     path.write_text("x = 1\n", encoding="utf-8")
+    engine_module.manifest_path(lane_repo).write_text(
+        json.dumps({
+            "repo": "fivetaku/insane-review",
+            "sha": sha,
+            "upstream_sha256": "",
+            "patches": [],
+            "engine_sha256": engine_module.digest(path),
+        }),
+        encoding="utf-8",
+    )
     return path
 
 

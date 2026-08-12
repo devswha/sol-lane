@@ -12,7 +12,7 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import proc
+from . import locks, proc
 from .config import Project, assert_safe_pack
 
 class ReviewError(Exception):
@@ -146,7 +146,9 @@ def ask(engine: Path, project: Project, root: Path, prompt: str, *,
     assert_safe_pack(project, root, globs)
     council = command(engine, project, prompt, include=include, python=python, council=True)
     try:
-        result = proc.run(council, cwd=root, env=browser_env(), timeout=project.max_wait + 300)
+        # One browser: another lane process must not drive it at the same time.
+        with locks.exclusive(locks.browser_lock_path()):
+            result = proc.run(council, cwd=root, env=browser_env(), timeout=project.max_wait + 300)
     except (OSError, subprocess.SubprocessError) as error:
         raise ReviewError(f"engine could not run: {error}") from error
     if result.returncode != 0:
@@ -160,7 +162,11 @@ def ask(engine: Path, project: Project, root: Path, prompt: str, *,
 def run(engine: Path, project: Project, root: Path, prompt: str, *,
         include: tuple[str, ...] | None = None, python: str | None = None) -> ReviewOutcome:
     assert_safe_pack(project, root, include or project.include)
-    before = responses(root)
-    result = proc.run(command(engine, project, prompt, include=include, python=python),
-                      cwd=root, env=browser_env(), capture=False)
-    return ReviewOutcome(returncode=result.returncode, response=newest_new_response(root, before))
+    # Held across the harvest too: otherwise a concurrent run's response file
+    # can be picked up as the answer to this prompt.
+    with locks.exclusive(locks.browser_lock_path()):
+        before = responses(root)
+        result = proc.run(command(engine, project, prompt, include=include, python=python),
+                          cwd=root, env=browser_env(), capture=False)
+        response = newest_new_response(root, before)
+    return ReviewOutcome(returncode=result.returncode, response=response)
