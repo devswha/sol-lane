@@ -15,6 +15,7 @@ uv run lane doctor
 ## 사용
 
 ```bash
+lane drive ea "T3 2AFC 집계 대안 적용"    # 계획→구현→게이트 루프
 lane review ea "persona_brain과 persistent_memory 결합에 경합 없나"
 lane review ea "<질문>" --include "src/ea/persona_brain.py,tests/test_persona_brain.py"
 lane review ea "<질문>" --paste     # CDP 없이 codexpro 번들 + 클립보드
@@ -30,6 +31,27 @@ lane doctor
 | 0 | 성공 — 검증된 응답을 회수해 저장 |
 | 1 | 전달 실패 — CDP 없음, fail-closed 중단, 빈 응답 |
 | 2 | 설정/엔진 문제 — 알 수 없는 프로젝트, 위험한 루트, 엔진 미벤더링 |
+
+## `lane drive` — Pro가 계획, gjc가 구현, 게이트가 판정
+
+```bash
+lane drive ea "<하고 싶은 일>" [--max-iters 2] [--session <sdk-session-id>]
+```
+
+```
+① Pro에게 계획 1회 요청 (레포 패킹해서)      ← Pro 2분·메시지 1통
+② 계획 → .ai-bridge/current-plan.md
+③ gjc가 자기 도구로 구현 (lane 전용 세션 디렉토리, --continue)
+④ 프로젝트 gate 실행 → 종료코드가 판정
+⑤ PASS면 끝, FAIL이면 게이트 출력을 들고 ①로 (최대 max_iters회)
+```
+
+설계 원칙 하나: **Pro는 구현 루프 안에 들어가지 않는다.** 판단은 비싸고 느리며
+(턴당 2분·구독 메시지 1통), 검증은 싸고 빠르다. 그래서 게이트가 심사관이고 Pro는
+제안자다. `max_iters`가 한 작업이 쓸 수 있는 Pro 메시지 수의 상한이다.
+
+구현은 **lane 전용 세션 디렉토리**(`.ai-bridge/lane-session`)에서 돈다. 네가 쓰고 있는
+ live 세션에 프롬프트가 주입될 일이 없다 — 그러려면 `--session <id>`로 명시해야 한다.
 
 ## Sol Pro 모드 — gjc 세션을 Pro로 돌리기
 
@@ -99,7 +121,8 @@ lane engine sync              →  둘을 합쳐 vendor/pack_and_ask.py 생성 +
 
 ## 다음 단계
 
-1. ~~`lane review` 안정화~~ ← 지금 여기
-2. insane-review fork — 패치를 커밋으로 승격하고 업스트림에 PR
-3. gjc SDK 판단층 — 파일 선별, 응답→계획 구조화, 게이트 PASS/FAIL
-4. `lane implement` — codexpro `watch-handoff`/`loop-handoff`로 구현·검증 루프
+1. ~~`lane review` 안정화~~
+2. ~~`lane serve` — Sol Pro 모드(대화)~~
+3. ~~`lane drive` — 계획·구현·게이트 루프~~ ← 지금 여기
+4. insane-review fork — `vendor/patches/*`를 커밋으로 승격하고 업스트림에 PR
+5. 선별·구조화 강화 — 파일 집합 자동 확정, 계획 스키마 검증
