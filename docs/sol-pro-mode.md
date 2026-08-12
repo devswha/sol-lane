@@ -68,6 +68,12 @@ Pro는 사소한 질문에도 2분 안팔을 쓴다(실측 125~129초, gjc 시�
 그대로 두면 gjc가 100초에 끊고 재시도하며, 뒤달아 도착한 답은 죽은 소켓에 써지고
 (`BrokenPipeError`) **같은 질문에 Pro 메시지를 한 통 더 날린다.**
 
+클라이언쪽 증상은 이 한 줄로 나온다:
+
+```
+OpenAI completions stream timed out while waiting for the first event
+```
+
 중요: **SSE 주석(`: ...`)은 이벤트로 치지 않는다.** 주석으로 하트비트를 보내면
 소켓은 살아있지만 타임아웃은 그대로 난다. 내용 없는 찭크(`delta.content = ""`)를
 주기적으로 보내야 한다.
