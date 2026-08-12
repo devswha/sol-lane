@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 import threading
+from contextlib import contextmanager
 import time
 import urllib.error
 import urllib.request
@@ -22,16 +24,24 @@ def post(url: str, payload: dict, *, timeout: float = 10.0):
     return urllib.request.urlopen(request, timeout=timeout)
 
 
-@pytest.fixture
-def server(request):
-    runner = request.param if hasattr(request, "param") else (lambda settings, prompt: "hello")
-    handler = serve_module.make_handler(SETTINGS, runner=runner, log=lambda *_: None)
+@contextmanager
+def running(runner, settings=SETTINGS):
+    handler = serve_module.make_handler(settings, runner=runner, log=lambda *_: None)
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
-    yield f"http://127.0.0.1:{httpd.server_address[1]}"
-    httpd.shutdown()
-    httpd.server_close()
+    try:
+        yield f"http://127.0.0.1:{httpd.server_address[1]}"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+@pytest.fixture
+def server(request):
+    runner = request.param if hasattr(request, "param") else (lambda settings, prompt: "hello")
+    with running(runner) as url:
+        yield url
 
 
 def test_render_prompt_keeps_order_and_labels_roles():
@@ -165,6 +175,47 @@ def test_requests_are_serialized_because_there_is_one_browser(server):
 
     assert errors == []
     assert _concurrent.count("enter") == 3
+
+
+def _slow_answer(settings, prompt):
+    time.sleep(0.6)
+    return "late answer"
+
+
+def test_stream_sends_heartbeats_while_pro_is_thinking():
+    settings = dataclasses.replace(SETTINGS, heartbeat_seconds=0.1)
+    with running(_slow_answer, settings) as url:
+        response = post(f"{url}/v1/chat/completions",
+                        {"stream": True, "messages": [{"role": "user", "content": "hi"}]})
+        body = response.read().decode()
+
+    assert ": lane waiting for Sol Pro" in body
+    assert body.index(": lane waiting") < body.index('"content": "late answer"')
+    assert body.endswith("data: [DONE]\n\n")
+
+
+@pytest.mark.parametrize("server", [_failing], indirect=True)
+def test_stream_failure_emits_an_error_frame_not_a_silent_stop(server):
+    response = post(f"{server}/v1/chat/completions",
+                    {"stream": True, "messages": [{"role": "user", "content": "hi"}]})
+
+    body = response.read().decode()
+    assert "lane_delivery_error" in body
+    assert "fail-closed" in body
+    assert '"content"' not in body
+
+
+@pytest.mark.parametrize("server", [_slow_answer], indirect=True)
+def test_a_client_hang_up_does_not_take_the_server_down(server):
+    request = urllib.request.Request(
+        f"{server}/v1/chat/completions",
+        data=json.dumps({"stream": True, "messages": [{"role": "user", "content": "hi"}]}).encode(),
+        headers={"content-type": "application/json"},
+    )
+    urllib.request.urlopen(request, timeout=10).close()
+
+    later = post(f"{server}/v1/chat/completions", {"messages": [{"role": "user", "content": "again"}]})
+    assert json.loads(later.read())["choices"][0]["message"]["content"] == "late answer"
 
 
 def test_run_engine_reports_a_non_zero_exit(monkeypatch):

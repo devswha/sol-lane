@@ -31,6 +31,33 @@ lane doctor
 | 1 | 전달 실패 — CDP 없음, fail-closed 중단, 빈 응답 |
 | 2 | 설정/엔진 문제 — 알 수 없는 프로젝트, 위험한 루트, 엔진 미벤더링 |
 
+## Sol Pro 모드 — gjc 세션을 Pro로 돌리기
+
+```bash
+lane serve                    # 127.0.0.1:8799 에 OpenAI 호환 엔드포인트
+SOL_PRO_LOCAL_KEY=local gjc --mpreset sol-pro
+```
+
+`~/.gjc/agent/models.yml`에 provider와 profile을 한 번 등록해두면 된다.
+
+```yaml
+providers:
+  sol-pro-local:
+    baseUrl: http://127.0.0.1:8799/v1
+    apiKeyEnv: SOL_PRO_LOCAL_KEY
+    api: openai-completions        # openai-chat 등 다른 철자는 조용히 무시된다
+    auth: apiKey
+    models:
+      - id: sol-pro
+profiles:
+  sol-pro:
+    required_providers: [sol-pro-local]
+    model_mapping:
+      default: sol-pro-local/sol-pro
+```
+
+자세한 계약과 제약은 [docs/sol-pro-mode.md](docs/sol-pro-mode.md)에 있다.
+
 ## 설정 (`lane.toml`)
 
 ```toml

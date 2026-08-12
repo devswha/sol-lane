@@ -45,6 +45,9 @@ class ServeSettings:
     max_wait: int = 1200
     force_answer_after: int = 0
     python: str | None = None
+    # Pro reasons for minutes; an HTTP client that sees no bytes gives up and
+    # retries, which costs another Pro message. Keep the stream warm.
+    heartbeat_seconds: float = 10.0
 
     def command(self, prompt: str) -> list[str]:
         args = [
@@ -132,6 +135,10 @@ def completion_payload(model: str, answer: str, prompt: str, *, delta: bool) -> 
     }
 
 
+def json_frame(payload: dict) -> bytes:
+    return f"data: {json.dumps(payload)}\n\n".encode()
+
+
 def sse_frames(model: str, answer: str, prompt: str) -> list[bytes]:
     opening = completion_payload(model, answer, prompt, delta=True)
     closing = completion_payload(model, answer, prompt, delta=True)
@@ -163,6 +170,10 @@ def make_handler(settings: ServeSettings, *, runner=run_engine, lock=None, log=p
 
             started = time.time()
             log(f"-> {len(messages)} messages, {len(prompt)} chars; waiting for Sol Pro")
+
+            if request.get("stream"):
+                return self._stream(model, prompt, started)
+
             with guard:  # one browser, one conversation
                 try:
                     answer = runner(settings, prompt)
@@ -170,9 +181,6 @@ def make_handler(settings: ServeSettings, *, runner=run_engine, lock=None, log=p
                     log(f"!! {error}")
                     return self._error(502, str(error))
             log(f"<- {len(answer)} chars in {time.time() - started:.0f}s")
-
-            if request.get("stream"):
-                return self._stream(model, answer, prompt)
             return self._json(200, completion_payload(model, answer, prompt, delta=False))
 
         def do_GET(self):
@@ -184,20 +192,59 @@ def make_handler(settings: ServeSettings, *, runner=run_engine, lock=None, log=p
             self.send_header("content-type", "application/json")
             self.send_header("content-length", str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
+            self._write(body)
 
         def _error(self, status: int, message: str):
             self._json(status, {"error": {"message": message, "type": "lane_delivery_error"}})
 
-        def _stream(self, model: str, answer: str, prompt: str):
+        def _stream(self, model: str, prompt: str, started: float):
+            """Headers first, heartbeats while Pro thinks, then the answer."""
             self.send_response(200)
             self.send_header("content-type", "text/event-stream")
             self.send_header("cache-control", "no-cache")
             self.send_header("connection", "close")
             self.end_headers()
+
+            outcome: dict = {}
+
+            def work():
+                with guard:  # one browser, one conversation
+                    try:
+                        outcome["answer"] = runner(settings, prompt)
+                    except ServeError as error:
+                        outcome["error"] = str(error)
+
+            worker = threading.Thread(target=work, daemon=True)
+            worker.start()
+            while True:
+                worker.join(timeout=settings.heartbeat_seconds)
+                if not worker.is_alive():
+                    break
+                if not self._write(b": lane waiting for Sol Pro\n\n"):
+                    return  # client hung up; the worker finishes and is discarded
+
+            if "error" in outcome:
+                log(f"!! {outcome['error']}")
+                self._write(json_frame({"error": {"message": outcome["error"],
+                                                  "type": "lane_delivery_error"}}))
+                self._write(b"data: [DONE]\n\n")
+                return
+
+            answer = outcome["answer"]
+            log(f"<- {len(answer)} chars in {time.time() - started:.0f}s")
             for frame in sse_frames(model, answer, prompt):
-                self.wfile.write(frame)
+                if not self._write(frame):
+                    return
+
+        def _write(self, payload: bytes) -> bool:
+            """Write to the client, reporting a hang-up instead of raising."""
+            try:
+                self.wfile.write(payload)
                 self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                log("!! client hung up mid-stream")
+                return False
+            return True
 
         def log_message(self, *args):
             pass
