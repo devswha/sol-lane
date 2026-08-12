@@ -1,7 +1,7 @@
 # gjc Sol Pro 모드 — 실측으로 확인된 경로
 
 **질문:** gjc 세션 자체를 Sol Pro로 돌릴 수 있나?
-**답:** 된다. 단 default 모델이 아니라 **role 모델**로만 쓸 값어치가 있다.
+**답:** 된다. **default 모델 하나로 붙이고, 서브에이전트는 붙이지 않는다.**
 
 ## 확인된 사실 (2026-08-12 실측)
 
@@ -69,31 +69,39 @@ gjc 세션 ──/v1/chat/completions (stream, tools)──▶ lane serve (로�
 `codexpro`는 이 경로에 등장하지 않는다. **Pro 모드의 병목은 codexpro가 아니라
 ChatGPT 쪽 Pro 표면이므로, codexpro를 fork해도 여기서 얻는 게 없다.**
 
-## 왜 default 모델로 쓰면 안 되나
+## 채택한 형태 — default 단독
 
-- Pro는 한 턴에 수 분을 쓴다. 에이전트 루프는 태스크당 수십 턴이다. 곱하면 시간이 폭발한다.
-- Pro 쿼터는 웹 구독 메시지 캡이다. 턴마다 깎인다.
-- 브라우저 하나·대화 하나 = 동시성 1. 서브에이전트 병렬이 죽는다.
-- CDP 대화는 stateful인데 OpenAI API는 stateless다. 매 요청 전체 메시지를 다시 보내면
-  Pro 컨텍스트가 금방 넘친다. 세션↔대화 매핑 전략이 필요하다.
-
-## 그래서 쓸 만한 형태
-
-Pro를 **판단 역할에만** 붙인다. 태스크당 Pro 호출 1~3회로 끝난다.
+판단을 쪼개지 않는다. Pro가 세션 전체를 잡고, 다른 모델을 role로 끼워넣지 않는다.
 
 ```yaml
 profiles:
   sol-pro:
-    required_providers: [sol-pro-local, openai-codex]
+    required_providers: [sol-pro-local]
     model_mapping:
-      default:  openai-codex/gpt-5.6-sol:high
-      planner:  sol-pro-local/sol-pro
-      critic:   sol-pro-local/sol-pro
-      executor: openai-codex/gpt-5.6-terra:xhigh
+      default: sol-pro-local/sol-pro
 ```
 
-이러면 `gjc --mpreset sol-pro`가 곧 Sol Pro 모드다. 계획과 비평은 Pro가, 수십 번의
-도구 호출은 빠른 모델이 한다.
+`gjc --mpreset sol-pro`가 곧 Sol Pro 모드다.
+
+서브에이전트를 붙이지 않으므로 `task`의 role 매핑도 이 프로필에서는 쓰지 않는다.
+`~/.gjc/agent/config.yml`의 `task.agentModelOverrides`가 살아 있으면 서브에이전트는
+여전히 다른 모델로 새므로, 이 모드에서는 `task`를 쓰지 않거나 오버라이드를 비운다.
+
+## default 단독이 강제하는 것
+
+역할을 쪼개면 Pro 호출이 태스크당 1~3회로 끝나지만, default 단독은 모든 턴이 Pro다.
+그래서 아래가 선택이 아니라 **필수**가 된다.
+
+- **tool call 브리지 필수.** 모든 도구 호출 턴이 Pro를 지난다. 프롬프트로 툴 스펙을
+  내리고 응답에서 tool call을 파싱해 OpenAI 포맷으로 되돌리는 게 shim의 본체다.
+  파싱 실패는 fail-closed — 추측해서 실행하지 않는다.
+- **요청 직렬화 필수.** 브라우저 하나·대화 하나라 동시성은 1이다. 큐를 두고 한 번에
+  하나만 태운다.
+- **대화 매핑 필수.** CDP 대화는 stateful, OpenAI API는 stateless다. 매 요청마다 전체
+  메시지를 다시 보내면 Pro 컨텍스트가 금방 넘친다. gjc 세션 ↔ ChatGPT 대화를 1:1로
+  묶고 증분만 보낸다.
+- **비용 인식.** 도구 왕복 한 번이 Pro 메시지 한 통이다. 턴당 수 분이 곱해진다.
+  긴 자동화가 아니라 깊은 한 판에 쓰는 모드로 취급한다.
 
 ## 남은 작업 (로드맵 3단계)
 
@@ -101,3 +109,6 @@ profiles:
 2. tool call 브리지 — 프롬프트 주입 + 파싱, 파싱 실패 시 fail-closed
 3. 세션↔ChatGPT 대화 매핑 (컨텍스트 재전송 최소화)
 4. 동시 요청 직렬화 (브라우저 1개 전제)
+
+현재 진척: 1번의 전제(gjc가 로컬 provider로 세션을 돈다)까지 실측 완료.
+shim은 아직 고정 응답을 내는 카나리이고 CDP에 연결되지 않았다.
