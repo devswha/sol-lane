@@ -182,15 +182,23 @@ def _slow_answer(settings, prompt):
     return "late answer"
 
 
-def test_stream_sends_heartbeats_while_pro_is_thinking():
+def test_stream_sends_chunk_heartbeats_before_the_answer():
+    """gjc aborts a stream whose first event is late, and SSE comments are not
+    events — so the heartbeat must be a parseable chunk."""
     settings = dataclasses.replace(SETTINGS, heartbeat_seconds=0.1)
     with running(_slow_answer, settings) as url:
         response = post(f"{url}/v1/chat/completions",
                         {"stream": True, "messages": [{"role": "user", "content": "hi"}]})
         body = response.read().decode()
 
-    assert ": lane waiting for Sol Pro" in body
-    assert body.index(": lane waiting") < body.index('"content": "late answer"')
+    chunks = [json.loads(line.removeprefix("data: "))
+              for line in body.splitlines()
+              if line.startswith("data: ") and not line.endswith("[DONE]")]
+    contents = [chunk["choices"][0]["delta"].get("content") for chunk in chunks]
+    assert contents[0] == "", "the first event must arrive before the engine answers"
+    assert contents.count("") >= 2, "heartbeats keep arriving while Pro reasons"
+    assert "late answer" in contents
+    assert contents.index("late answer") > 0
     assert body.endswith("data: [DONE]\n\n")
 
 
@@ -200,9 +208,12 @@ def test_stream_failure_emits_an_error_frame_not_a_silent_stop(server):
                     {"stream": True, "messages": [{"role": "user", "content": "hi"}]})
 
     body = response.read().decode()
+    contents = [json.loads(line.removeprefix("data: "))["choices"][0]["delta"].get("content")
+                for line in body.splitlines()
+                if line.startswith("data: ") and "choices" in line]
     assert "lane_delivery_error" in body
     assert "fail-closed" in body
-    assert '"content"' not in body
+    assert set(contents) <= {""}, "a failed delivery must not emit answer text"
 
 
 @pytest.mark.parametrize("server", [_slow_answer], indirect=True)

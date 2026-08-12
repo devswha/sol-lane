@@ -45,8 +45,10 @@ class ServeSettings:
     max_wait: int = 1200
     force_answer_after: int = 0
     python: str | None = None
-    # Pro reasons for minutes; an HTTP client that sees no bytes gives up and
-    # retries, which costs another Pro message. Keep the stream warm.
+    # Pro reasons for minutes, and gjc aborts a stream whose first *event* has
+    # not arrived within retry.streamFirstEventTimeoutMs (100s by default),
+    # then retries — spending another Pro message on the same question. SSE
+    # comments do not count as events, so the heartbeat has to be a real chunk.
     heartbeat_seconds: float = 10.0
 
     def command(self, prompt: str) -> list[str]:
@@ -139,6 +141,17 @@ def json_frame(payload: dict) -> bytes:
     return f"data: {json.dumps(payload)}\n\n".encode()
 
 
+def heartbeat_frame(model: str) -> bytes:
+    """A content-free chunk that still counts as a stream event."""
+    return json_frame({
+        "id": "chatcmpl-lane",
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}],
+    })
+
+
 def sse_frames(model: str, answer: str, prompt: str) -> list[bytes]:
     opening = completion_payload(model, answer, prompt, delta=True)
     closing = completion_payload(model, answer, prompt, delta=True)
@@ -216,11 +229,13 @@ def make_handler(settings: ServeSettings, *, runner=run_engine, lock=None, log=p
 
             worker = threading.Thread(target=work, daemon=True)
             worker.start()
+            if not self._write(heartbeat_frame(model)):
+                return
             while True:
                 worker.join(timeout=settings.heartbeat_seconds)
                 if not worker.is_alive():
                     break
-                if not self._write(b": lane waiting for Sol Pro\n\n"):
+                if not self._write(heartbeat_frame(model)):
                     return  # client hung up; the worker finishes and is discarded
 
             if "error" in outcome:
