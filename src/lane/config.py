@@ -32,6 +32,7 @@ class Project:
     name: str
     root: Path
     include: tuple[str, ...]
+    gate: str | None
     model: str
     require_model: str
     force_answer_after: int
@@ -114,7 +115,7 @@ def load(path: Path) -> Config:
 def _project(name: str, table: object, defaults: dict[str, object]) -> Project:
     if not isinstance(table, dict):
         raise ConfigError(f"[projects.{name}] must be a table")
-    unknown = set(table) - {"root", "include", *_DEFAULTS}
+    unknown = set(table) - {"root", "include", "gate", *_DEFAULTS}
     if unknown:
         raise ConfigError(f"[projects.{name}] has unknown keys: {', '.join(sorted(unknown))}")
 
@@ -126,6 +127,10 @@ def _project(name: str, table: object, defaults: dict[str, object]) -> Project:
     include = table.get("include", [])
     if not isinstance(include, list) or not include or not all(isinstance(item, str) and item for item in include):
         raise ConfigError(f"[projects.{name}] requires a non-empty include list of globs")
+
+    gate = table.get("gate")
+    if gate is not None and (not isinstance(gate, str) or not gate.strip()):
+        raise ConfigError(f"[projects.{name}] gate must be a non-empty shell command")
 
     merged = {**defaults, **{key: table[key] for key in _DEFAULTS if key in table}}
     force_answer_after = _non_negative_int(merged["force_answer_after"], name, "force_answer_after")
@@ -139,6 +144,7 @@ def _project(name: str, table: object, defaults: dict[str, object]) -> Project:
         name=name,
         root=root,
         include=tuple(include),
+        gate=gate.strip() if isinstance(gate, str) else None,
         model=str(merged["model"]),
         require_model=str(merged["require_model"]),
         force_answer_after=force_answer_after,

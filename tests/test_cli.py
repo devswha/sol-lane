@@ -92,6 +92,26 @@ def test_doctor_is_clean_when_engine_and_root_are_fine(write_config, lane_repo: 
     assert "root:demo   ok" in capsys.readouterr().out
 
 
+def test_drive_dry_run_prints_plan_implement_and_gate(write_config, lane_repo: Path, capsys, project_root: Path):
+    config = write_config(extra='gate = "pytest -q"\n')
+    vendored_engine(lane_repo)
+
+    assert cli.main(["--config", str(config), "drive", "demo", "do the thing", "--dry-run"]) == cli.EXIT_OK
+    lines = capsys.readouterr().out.strip().splitlines()
+    assert "--require-model GPT-5.6" in lines[0] and "--council" in lines[0]
+    assert lines[1].startswith("gjc -p --no-title --session-dir ")
+    assert str(project_root) in lines[1]
+    assert lines[2] == "pytest -q"
+
+
+def test_drive_without_a_gate_is_refused(write_config, lane_repo: Path, capsys):
+    config = write_config()
+    vendored_engine(lane_repo)
+
+    assert cli.main(["--config", str(config), "drive", "demo", "x", "--dry-run"]) == cli.EXIT_CONFIG
+    assert "needs a gate command" in capsys.readouterr().err
+
+
 def test_missing_config_is_a_config_error(tmp_path: Path, capsys):
     assert cli.main(["--config", str(tmp_path / "nope.toml"), "projects"]) == cli.EXIT_CONFIG
     assert "cannot read" in capsys.readouterr().err

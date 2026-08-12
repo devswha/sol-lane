@@ -14,6 +14,10 @@ from pathlib import Path
 
 from .config import Project
 
+class ReviewError(Exception):
+    """The engine did not deliver a verified answer. Maps to exit code 1."""
+
+
 CDP_URL = "http://127.0.0.1:9222/json/version"
 RESPONSE_GLOB = ".insane-review/response_*.md"
 X11_SOCKETS = "/tmp/.X11-unix/X*"
@@ -25,11 +29,16 @@ class ReviewOutcome:
     response: Path | None
 
 
-def engine_args(project: Project, prompt: str, *, include: tuple[str, ...] | None = None) -> list[str]:
+def engine_args(project: Project, prompt: str, *, include: tuple[str, ...] | None = None,
+                council: bool = False) -> list[str]:
     """Engine arguments for a correctness review.
 
     Deliberately never emits --compress or --remove-comments: they strip
     function bodies, which is exactly the evidence a review needs.
+
+    ``council`` switches to the stdout-only mode (progress goes to stderr and
+    the prompt is positional), which is what a caller that wants the answer as
+    a string needs.
     """
     globs = include or project.include
     args = [
@@ -38,7 +47,6 @@ def engine_args(project: Project, prompt: str, *, include: tuple[str, ...] | Non
         "--model", project.model,
         "--require-model", project.require_model,
         "--max-wait", str(project.max_wait),
-        "--prompt", prompt,
     ]
     if project.force_answer_after:
         args += ["--force-answer-after", str(project.force_answer_after)]
@@ -46,12 +54,15 @@ def engine_args(project: Project, prompt: str, *, include: tuple[str, ...] | Non
         args.append("--no-project")
     if project.delete_pack:
         args.append("--delete-pack")
-    return args
+    if council:
+        return [*args, "--council", prompt]
+    return [*args, "--prompt", prompt]
 
 
 def command(engine: Path, project: Project, prompt: str, *, include: tuple[str, ...] | None = None,
-            python: str | None = None) -> list[str]:
-    return [python or sys.executable, str(engine), *engine_args(project, prompt, include=include)]
+            python: str | None = None, council: bool = False) -> list[str]:
+    return [python or sys.executable, str(engine),
+            *engine_args(project, prompt, include=include, council=council)]
 
 
 def cdp_up(url: str = CDP_URL, *, timeout: float = 3.0) -> bool:
@@ -103,6 +114,24 @@ def newest_new_response(root: Path, before: set[Path]) -> Path | None:
     if not created:
         return None
     return max(created, key=lambda path: path.stat().st_mtime)
+
+
+def ask(engine: Path, project: Project, root: Path, prompt: str, *,
+        include: tuple[str, ...] | None = None, python: str | None = None) -> str:
+    """Pack the project, ask Sol Pro, and return the answer as text."""
+    council = command(engine, project, prompt, include=include, python=python, council=True)
+    try:
+        result = subprocess.run(council, cwd=root, env=browser_env(), capture_output=True,
+                                text=True, timeout=project.max_wait + 300)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise ReviewError(f"engine could not run: {error}") from error
+    if result.returncode != 0:
+        detail = (result.stderr or "").strip().splitlines()
+        raise ReviewError(f"engine exited {result.returncode}: {detail[-1] if detail else 'no detail'}")
+    answer = result.stdout.strip()
+    if not answer:
+        raise ReviewError("engine returned an empty answer (fail-closed)")
+    return answer
 
 
 def run(engine: Path, project: Project, root: Path, prompt: str, *,

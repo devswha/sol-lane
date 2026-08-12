@@ -14,6 +14,7 @@ import shutil
 import sys
 from pathlib import Path
 
+from . import drive as drive_module
 from . import engine as engine_module
 from . import paste as paste_module
 from . import review as review_module
@@ -36,6 +37,14 @@ def build_parser() -> argparse.ArgumentParser:
     review.add_argument("--include", help="comma-separated globs overriding the configured set")
     review.add_argument("--paste", action="store_true", help="skip CDP; bundle for manual paste instead")
     review.add_argument("--dry-run", action="store_true", help="print the command instead of running it")
+
+    drive = sub.add_parser("drive", help="Pro plans, gjc implements, the local gate decides")
+    drive.add_argument("project")
+    drive.add_argument("intent")
+    drive.add_argument("--include", help="comma-separated globs overriding the configured set")
+    drive.add_argument("--max-iters", type=int, default=2, help="planning attempts before giving up")
+    drive.add_argument("--session", help="send into this existing gjc SDK session instead of a lane-owned one")
+    drive.add_argument("--dry-run", action="store_true", help="print the commands instead of running them")
 
     sub.add_parser("projects", help="list configured projects")
     sub.add_parser("doctor", help="check engine, browser, and project roots")
@@ -65,11 +74,13 @@ def main(argv: list[str] | None = None) -> int:
             return _engine_sync(config, refresh=args.refresh)
         if args.command == "serve":
             return _serve(config, args)
+        if args.command == "drive":
+            return _drive(config, args)
         return _review(config, args)
     except (ConfigError, engine_module.EngineError) as error:
         print(f"lane: {error}", file=sys.stderr)
         return EXIT_CONFIG
-    except paste_module.PasteError as error:
+    except (paste_module.PasteError, review_module.ReviewError, drive_module.DriveError) as error:
         print(f"lane: {error}", file=sys.stderr)
         return EXIT_DELIVERY
 
@@ -154,10 +165,48 @@ def _serve(config: Config, args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _drive(config: Config, args: argparse.Namespace) -> int:
+    project = config.project(args.project)
+    root = checked_root(project)
+    if not project.gate:
+        raise ConfigError(f"[projects.{project.name}] needs a gate command for `lane drive`")
+    include = _globs(args.include)
+    engine_path = engine_module.resolve(_repo_root(config), override=os.environ.get("LANE_ENGINE"))
+
+    if args.dry_run:
+        plan = root / drive_module.PLAN_RELPATH
+        print(" ".join(review_module.command(engine_path, project, "<plan request>",
+                                             include=include, council=True)))
+        print(" ".join(drive_module.implement_command(root, plan, first=True, session=args.session)))
+        print(project.gate)
+        return EXIT_OK
+
+    outcome = drive_module.drive(
+        root,
+        args.intent,
+        project.gate,
+        max_iters=args.max_iters,
+        planner=lambda prompt: review_module.ask(engine_path, project, root, prompt, include=include),
+        implementer=lambda plan, first: drive_module.implement(root, plan, first=first, session=args.session),
+        gate_runner=lambda: drive_module.run_gate(root, project.gate),
+    )
+    print(f"verdict    {'PASS' if outcome.passed else 'FAIL'} after {outcome.iterations} attempt(s)")
+    if not outcome.passed:
+        print(f"plan       {root / drive_module.PLAN_RELPATH}")
+        return EXIT_DELIVERY
+    return EXIT_OK
+
+
+def _globs(value: str | None) -> tuple[str, ...] | None:
+    if not value:
+        return None
+    return tuple(glob.strip() for glob in value.split(",") if glob.strip())
+
+
 def _review(config: Config, args: argparse.Namespace) -> int:
     project = config.project(args.project)
     root = checked_root(project)
-    include = tuple(glob.strip() for glob in args.include.split(",") if glob.strip()) if args.include else None
+    include = _globs(args.include)
 
     if args.paste:
         if args.dry_run:
