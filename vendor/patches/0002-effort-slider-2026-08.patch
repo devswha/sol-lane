@@ -1,0 +1,72 @@
+--- /tmp/baseline.py	2026-08-12 22:42:12.533547047 +0900
++++ /tmp/patched-current.py	2026-08-12 22:42:12.451545551 +0900
+@@ -795,6 +795,35 @@
+     return out
+ 
+ 
++def _drive_effort_slider(page, slider, want_l: str):
++    """추론단계가 목록이 아니라 슬라이더(role=slider, aria-valuenow 0..N)로 렌더되는 UI 대응.
++
++    2026-08 ChatGPT는 '더 빠르게 ↔ 더 똑똑하게' 5단 슬라이더로 바뀌었고 마지막 칸이 Pro다.
++    단계 이름은 composer pill이 실시간으로 반영하므로 그것을 판정 근거로 쓴다.
++    반환: 선택된 단계 라벨(성공) 또는 None(실패 → 호출자가 fail-closed).
++    """
++    try:
++        slider.click(force=True)
++        time.sleep(0.4)
++        for _ in range(8):  # 최소 칸으로 정규화한 뒤 오른쪽으로 훑는다
++            if slider.get_attribute("aria-valuenow") == slider.get_attribute("aria-valuemin"):
++                break
++            page.keyboard.press("ArrowLeft")
++            time.sleep(0.35)
++        for _ in range(9):
++            pills = read_model_pills(page)
++            label = (pills[0] or "").strip() if pills else ""
++            if label and want_l in label.lower():
++                return label[:40]
++            if slider.get_attribute("aria-valuenow") == slider.get_attribute("aria-valuemax"):
++                return None
++            page.keyboard.press("ArrowRight")
++            time.sleep(0.5)
++    except Exception:
++        return None
++    return None
++
++
+ def _open_switcher(page):
+     for sel in MODEL_SWITCHER_SELECTORS:
+         try:
+@@ -897,7 +926,32 @@
+ 
+     # 추론단계 클릭 대상 탐색 (현재 선택이 이미 원하는 단계면 클릭 불필요)
+     clicked = None
+-    if before["effort_checked"] and want_l in before["effort_checked"].lower():
++
++    # 목록형 추론단계가 없으면 슬라이더 UI다 — 밀어서 맞추고 검증은 기존 재오픈 경로에 맡긴다.
++    if not before["items"]:
++        slider = None
++        try:
++            slider = page.query_selector('[role="slider"]')
++        except Exception:
++            slider = None
++        if slider is not None:
++            label = _drive_effort_slider(page, slider, want_l)
++            if not label:
++                print(f"  ⚠️  추론단계 슬라이더에서 '{want}' 단계를 못 찾음 → 중단(전송 안 함)")
++                try:
++                    page.keyboard.press("Escape")
++                except Exception:
++                    pass
++                return False, None
++            print(f"  추론단계 슬라이더: {label!r} 선택")
++            clicked = f"slider:{label}"
++            try:
++                page.keyboard.press("Escape")
++            except Exception:
++                pass
++            time.sleep(0.5)
++
++    if not clicked and before["effort_checked"] and want_l in before["effort_checked"].lower():
+         clicked = f"already:{before['effort_checked']}"
+         try:
+             # 검증용 재오픈이 열린 메뉴를 토글로 닫지 않도록 먼저 닫아둔다.
