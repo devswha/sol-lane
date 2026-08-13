@@ -9,6 +9,13 @@ compiles, and write the result to vendor/pack_and_ask.py.
 A produced engine is only trusted while a manifest proves which pin and which
 patches produced it: after a failed pin bump the previous engine is still on
 disk, and running it would silently review with the wrong tool.
+
+One engine is exempt: the one an operator names in LANE_ENGINE. That override
+exists to run an engine that is not vendored yet — a patch being written — so
+verifying it against the manifest would remove its only purpose. What it must
+not be is quiet. An env var set an hour ago and forgotten is the same accident
+the manifest exists to prevent, arriving by a different door, so every run that
+uses an override says so.
 """
 
 from __future__ import annotations
@@ -31,6 +38,7 @@ MANIFEST_NAME = "engine.json"
 PATCH_DIR = "patches"
 UPSTREAM_CACHE = ".upstream"
 SYNC_LOCK = ".engine-sync.lock"
+OVERRIDE_ENV = "LANE_ENGINE"
 
 
 class EngineError(Exception):
@@ -61,11 +69,18 @@ def digest(path: Path) -> str:
 
 
 def resolve(repo_root: Path, *, override: str | None = None, pin: EnginePin | None = None) -> Path:
-    """Return the engine to run. Fails closed — never silently downloads."""
+    """Return the engine to run. Fails closed — never silently downloads.
+
+    An override skips the pin and the patch manifest by design; see the module
+    docstring, and print `override_notice()` wherever this is called so the skip
+    is visible. It still has to be a Python file that compiles, which is the same
+    check a vendored engine passes before it is published.
+    """
     if override:
         candidate = Path(override).expanduser()
         if not candidate.is_file():
-            raise EngineError(f"LANE_ENGINE points at a missing file: {candidate}")
+            raise EngineError(f"{OVERRIDE_ENV} points at a missing file: {candidate}")
+        _verify_compiles(candidate)
         return candidate
     candidate = engine_path(repo_root)
     if not candidate.is_file():
@@ -73,6 +88,14 @@ def resolve(repo_root: Path, *, override: str | None = None, pin: EnginePin | No
     if pin is not None:
         _verify_manifest(repo_root, candidate, pin)
     return candidate
+
+
+def override_notice(override: str | None) -> str | None:
+    """What to tell the operator when an override is in play, if one is."""
+    if not override:
+        return None
+    return (f"engine override {override} — unverified: no pin, no patch manifest checked. "
+            f"unset {OVERRIDE_ENV} to use the vendored engine")
 
 
 def _verify_manifest(repo_root: Path, engine: Path, pin: EnginePin) -> None:

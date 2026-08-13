@@ -133,8 +133,13 @@ def _repo_root(config: Config) -> Path:
 
 
 def _engine(config: Config) -> Path:
-    return engine_module.resolve(_repo_root(config), override=os.environ.get("LANE_ENGINE"),
-                                 pin=config.engine)
+    override = os.environ.get(engine_module.OVERRIDE_ENV)
+    notice = engine_module.override_notice(override)
+    if notice:
+        # Loud on every run: a forgotten env var is how you review with the wrong
+        # tool while the manifest sits there proving nothing.
+        print(f"lane: {notice}", file=sys.stderr)
+    return engine_module.resolve(_repo_root(config), override=override, pin=config.engine)
 
 
 def _projects(config: Config) -> int:
@@ -149,10 +154,15 @@ def _doctor(config: Config) -> int:
     root = _repo_root(config)
     problems = 0
 
+    override = os.environ.get(engine_module.OVERRIDE_ENV)
     try:
-        engine_path = engine_module.resolve(root, override=os.environ.get("LANE_ENGINE"),
-                                            pin=config.engine)
-        print(f"engine     ok       {engine_path}")
+        engine_path = engine_module.resolve(root, override=override, pin=config.engine)
+        state = "override" if override else "ok"
+        print(f"engine     {state:8} {engine_path}")
+        notice = engine_module.override_notice(override)
+        if notice:
+            print(f"           {notice}")
+            problems += 1
     except engine_module.EngineError as error:
         print(f"engine     missing  {error}")
         problems += 1

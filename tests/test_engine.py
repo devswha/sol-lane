@@ -150,3 +150,26 @@ def test_an_empty_upstream_is_refused(lane_repo: Path, monkeypatch):
 
     with pytest.raises(engine_module.EngineError, match="engine is empty"):
         engine_module.sync(lane_repo, PIN)
+
+
+def test_an_override_that_does_not_compile_is_refused(lane_repo: Path, tmp_path: Path):
+    """An override skips the manifest by design, but not the compile check that
+    every vendored engine passes."""
+    override = tmp_path / "broken.py"
+    override.write_text("def oops(\n", encoding="utf-8")
+
+    with pytest.raises(engine_module.EngineError, match="does not compile"):
+        engine_module.resolve(lane_repo, override=str(override))
+
+
+def test_an_override_announces_that_nothing_was_verified():
+    notice = engine_module.override_notice("/tmp/wip-engine.py")
+
+    assert "/tmp/wip-engine.py" in notice
+    assert "unverified" in notice
+    assert engine_module.OVERRIDE_ENV in notice
+
+
+def test_no_override_means_no_notice():
+    assert engine_module.override_notice(None) is None
+    assert engine_module.override_notice("") is None

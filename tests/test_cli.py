@@ -194,3 +194,31 @@ def test_a_closed_pipe_is_not_a_traceback(write_config, project_root: Path, monk
     monkeypatch.setattr(builtins, "print", print_then_break)
 
     assert cli.main(["--config", str(config), "projects"]) == cli.EXIT_OK
+
+
+def test_doctor_flags_an_engine_override_as_a_problem(write_config, lane_repo: Path,
+                                                      tmp_path: Path, monkeypatch, capsys):
+    """Sol Pro, reviewing engine.py 2026-08-13: LANE_ENGINE skipped the pin, the
+    manifest and both hash checks, and said nothing about it."""
+    config = write_config()
+    override = tmp_path / "wip.py"
+    override.write_text("x = 1\n", encoding="utf-8")
+    monkeypatch.setenv("LANE_ENGINE", str(override))
+
+    assert cli.main(["--config", str(config), "doctor"]) == cli.EXIT_CONFIG
+    out = capsys.readouterr().out
+    assert "override" in out
+    assert "unverified" in out
+
+
+def test_review_warns_before_running_an_overridden_engine(write_config, lane_repo: Path,
+                                                          tmp_path: Path, monkeypatch, capsys):
+    config = write_config()
+    override = tmp_path / "wip.py"
+    override.write_text("x = 1\n", encoding="utf-8")
+    monkeypatch.setenv("LANE_ENGINE", str(override))
+
+    assert cli.main(["--config", str(config), "review", "demo", "질문", "--dry-run"]) == cli.EXIT_OK
+    captured = capsys.readouterr()
+    assert "unverified" in captured.err
+    assert str(override) in captured.out, "and it really did use the override"
