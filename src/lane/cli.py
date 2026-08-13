@@ -47,6 +47,14 @@ def build_parser() -> argparse.ArgumentParser:
     drive.add_argument("--session", help="send into this existing gjc SDK session instead of a lane-owned one")
     drive.add_argument("--dry-run", action="store_true", help="print the commands instead of running them")
 
+    harvest = sub.add_parser("harvest", help="recover an answer from a conversation already paid for")
+    harvest.add_argument("project")
+    harvest.add_argument("source", nargs="?",
+                         help="conversation URL or manifest path (default: this project's newest run)")
+    harvest.add_argument("--max-wait", type=int, default=review_module.HARVEST_WAIT_SECONDS,
+                         help="seconds to wait for the answer (raise it when Pro is still thinking)")
+    harvest.add_argument("--dry-run", action="store_true", help="print the command instead of running it")
+
     sub.add_parser("projects", help="list configured projects")
     sub.add_parser("doctor", help="check engine, browser, and project roots")
 
@@ -78,6 +86,8 @@ def main(argv: list[str] | None = None) -> int:
             return _serve(config, args)
         if args.command == "drive":
             return _drive(config, args)
+        if args.command == "harvest":
+            return _harvest(config, args)
         return _review(config, args)
     except (ConfigError, engine_module.EngineError) as error:
         print(f"lane: {error}", file=sys.stderr)
@@ -279,6 +289,43 @@ def _review(config: Config, args: argparse.Namespace) -> int:
     outcome = review_module.run(engine_path, project, root, args.prompt, include=include)
     if outcome.returncode != 0 or outcome.response is None:
         print("lane: review did not produce a verified response (fail-closed)", file=sys.stderr)
+        _print_harvest_hint(root, project.name)
+        return EXIT_DELIVERY
+    print(f"response   {outcome.response}")
+    return EXIT_OK
+
+
+def _print_harvest_hint(root: Path, project: str) -> None:
+    """A spent message is not a lost one: name the retry that costs nothing."""
+    manifest = review_module.newest_manifest(root)
+    conversation = review_module.conversation_of(manifest) if manifest else None
+    if conversation is None:
+        return
+    print(f"chat       {conversation}", file=sys.stderr)
+    print(f"retry      lane harvest {project}   # no new message is sent", file=sys.stderr)
+
+
+def _harvest(config: Config, args: argparse.Namespace) -> int:
+    project = config.project(args.project)
+    root = checked_root(project)
+    engine_path = _engine(config)
+
+    source = args.source
+    if source is None:
+        manifest = review_module.newest_manifest(root)
+        if manifest is None:
+            raise review_module.ReviewError(
+                f"no run manifest under {root / '.insane-review'} to harvest from")
+        source = str(manifest)
+
+    if args.dry_run:
+        print(" ".join(review_module.harvest_command(engine_path, project, source,
+                                                     max_wait=args.max_wait)))
+        return EXIT_OK
+
+    outcome = review_module.harvest(engine_path, project, root, source, max_wait=args.max_wait)
+    if outcome.returncode != 0 or outcome.response is None:
+        print("lane: nothing to harvest from that conversation yet", file=sys.stderr)
         return EXIT_DELIVERY
     print(f"response   {outcome.response}")
     return EXIT_OK

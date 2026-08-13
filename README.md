@@ -20,6 +20,7 @@ lane review ea "persona_brain과 persistent_memory 결합에 경합 없나"
 lane review ea "<질문>" --include "src/ea/persona_brain.py,tests/test_persona_brain.py"
 lane review ea "<질문>" --paste     # CDP 없이 codexpro 번들 + 클립보드
 lane review ea "<질문>" --dry-run   # 실행할 커맨드만 출력
+lane harvest ea                    # 이미 값을 치른 대화에서 답만 회수 (전송 없음)
 lane projects
 lane doctor
 ```
@@ -96,6 +97,25 @@ profiles:
 
 자세한 계약과 제약은 [docs/sol-pro-mode.md](docs/sol-pro-mode.md)에 있다.
 
+## 긴 판은 죽는다 — 죽어도 값은 치렀다
+
+실측 3연속: 93 KB 판은 18분+에 마감으로 포기, 290 KB 판은 40분 20초 뒤 수동 salvage,
+164 KB 판은 **31분 33초 생성 후 중단**됐다. 마지막 판의 증상 문자열은 대화에 남는
+`생각 중단됨`이고, assistant 메시지 노드는 0개다. 그 뒤 구엔진은 죽은 대화를 19분 더
+폴링했다.
+
+그래서 회수를 분리했다. 엔진은 전송 직후 결속된 대화 URL을
+`.insane-review/manifest_<label>_<tag>.json`에 적고, 실패한 `lane review`는 그 URL과
+회수 커맨드를 알려준다.
+
+```
+lane: review did not produce a verified response (fail-closed)
+chat       https://chatgpt.com/c/…
+retry      lane harvest lane   # no new message is sent
+```
+
+`lane harvest`는 패킹도 프롬프트도 전송도 하지 않는다. 대화에서 답만 긁어온다.
+
 ## 설정 (`lane.toml`)
 
 ```toml
@@ -125,9 +145,19 @@ lane engine sync              →  둘을 합쳐 vendor/pack_and_ask.py 생성 +
 ```
 
 패치가 안 붙거나 결과가 컴파일되지 않으면 **아무것도 쓰지 않고 중단한다.**
-`vendor/patches/0001-chatgpt-dom-2026-08.patch`는 2026-08-07 Pro 감사 때 캐시에만
-남아 있던 DOM 수정(모델명 label/value 라인, effort 값라인 읽기, 이미 선택된 항목
-스킵, 메뉴 토글 가드)을 되살린 것이다.
+
+- `0001-chatgpt-dom-2026-08.patch` — 2026-08-07 Pro 감사 때 캐시에만 남아 있던 DOM
+  수정(모델명 label/value 라인, effort 값라인 읽기, 이미 선택된 항목 스킵, 메뉴 토글
+  가드)을 되살린 것.
+- `0002-effort-slider-2026-08.patch` — 추론단계가 라디오 목록에서 5단 슬라이더로
+  바뀐 UI 대응. 이 패치는 0001이 적용된 트리 기준이다 — 단독으로 업스트림에 얹으면
+  둘째 헝크가 거부된다. 적용 순서가 계약이다.
+
+그리고 이 레이아웃은 한동안 거짓이었다. `~/.gitignore_global`의 맨 `vendor/` 한 줄이
+글로벌 ignore로 먼저 적용되어 **패치 두 개가 어느 커밋에도 들어간 적이 없었다.**
+"핀을 올리면 로컬 수정이 사라진다"를 막겠다고 만든 구조가, 정작 그 수정을 이 디스크
+하나에만 두고 있었다. 이제 `.gitignore`가 `!vendor/` → `vendor/*` →
+`!vendor/patches/*.patch` 삼단으로 되짚어 추적한다.
 
 ## 정밀도에 대한 기본값
 
@@ -140,6 +170,9 @@ lane engine sync              →  둘을 합쳐 vendor/pack_and_ask.py 생성 +
 
 1. ~~`lane review` 안정화~~
 2. ~~`lane serve` — Sol Pro 모드(대화)~~
-3. ~~`lane drive` — 계획·구현·게이트 루프~~ ← 지금 여기
-4. insane-review fork — `vendor/patches/*`를 커밋으로 승격하고 업스트림에 PR
-5. 선별·구조화 강화 — 파일 집합 자동 확정, 계획 스키마 검증
+3. ~~`lane drive` — 계획·구현·게이트 루프~~
+4. ~~엔진 핀 v0.6.1 + `lane harvest`~~ ← 지금 여기. 중단된 판을 메시지 없이 회수한다.
+5. insane-review fork — `0001`은 업스트림 main에 세 헝크 전부 붙는다(offset 167).
+   PR 후보 확정.
+6. tool call 브리지 — serve가 도구 턴을 돌리려면 필수. 지금은 400으로 거절한다.
+7. 선별·구조화 강화 — 파일 집합 자동 확정, 계획 스키마 검증

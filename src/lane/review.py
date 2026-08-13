@@ -5,6 +5,7 @@ from __future__ import annotations
 import glob
 import json
 import os
+import re
 import subprocess
 import sys
 import urllib.error
@@ -21,6 +22,13 @@ class ReviewError(Exception):
 
 CDP_URL = "http://127.0.0.1:9222/json/version"
 RESPONSE_GLOB = ".insane-review/response_*.md"
+# The engine persists the bound conversation URL the moment the message is sent,
+# so a run that dies afterwards is recoverable without spending another one.
+MANIFEST_GLOB = ".insane-review/manifest_*.json"
+# Long enough to load the conversation and read a finished answer, short enough
+# that probing a dead one is not a vigil.
+HARVEST_WAIT_SECONDS = 300
+CONVERSATION_RE = re.compile(r"/c/[0-9a-f]{8}[0-9a-f-]{4,}", re.IGNORECASE)
 X11_SOCKETS = "/tmp/.X11-unix/X*"
 # Measured: a 297 KB pack kept Pro reasoning past 20 minutes on one question,
 # while ~100 KB packs answer in two. Latency is not linear in pack size.
@@ -67,6 +75,40 @@ def command(engine: Path, project: Project, prompt: str, *, include: tuple[str, 
             python: str | None = None, council: bool = False) -> list[str]:
     return [python or sys.executable, str(engine),
             *engine_args(project, prompt, include=include, council=council)]
+
+
+def harvest_command(engine: Path, project: Project, source: str, *,
+                    max_wait: int = HARVEST_WAIT_SECONDS, python: str | None = None) -> list[str]:
+    """Read an answer out of a conversation that was already paid for.
+
+    No packing, no prompt, no send: *source* is a conversation URL or the run
+    manifest the engine wrote when it sent the message.
+
+    The project's ``max_wait`` is deliberately not inherited. That budget exists
+    for a message in flight; a harvest asks "is the answer there now", and a
+    conversation that was interrupted would otherwise be watched for an hour.
+    Pass a longer wait when the answer is known to still be generating.
+    """
+    return [python or sys.executable, str(engine),
+            "--harvest", source,
+            # The engine refuses --require-model without --model, even on a path
+            # that selects nothing: harvest never opens the model switcher.
+            "--model", project.model,
+            "--require-model", project.require_model,
+            "--max-wait", str(max_wait)]
+
+
+def newest_manifest(root: Path) -> Path | None:
+    manifests = [path for path in root.glob(MANIFEST_GLOB) if path.is_file()]
+    return max(manifests, key=lambda path: path.stat().st_mtime, default=None)
+
+
+def conversation_of(manifest: Path) -> str | None:
+    try:
+        url = json.loads(manifest.read_text(encoding="utf-8")).get("chat_url")
+    except (OSError, ValueError):
+        return None
+    return url if isinstance(url, str) and CONVERSATION_RE.search(url) else None
 
 
 def pack_bytes(root: Path, globs: tuple[str, ...]) -> tuple[int, int]:
@@ -157,6 +199,21 @@ def ask(engine: Path, project: Project, root: Path, prompt: str, *,
     if not answer:
         raise ReviewError("engine returned an empty answer (fail-closed)")
     return answer
+
+
+def harvest(engine: Path, project: Project, root: Path, source: str, *,
+            max_wait: int = HARVEST_WAIT_SECONDS, python: str | None = None) -> ReviewOutcome:
+    """Recover the answer from an existing conversation. Sends nothing.
+
+    Nothing is packed, so there is no egress to guard here; the browser lock is
+    still required because the harvest drives the same single browser.
+    """
+    with locks.exclusive(locks.browser_lock_path()):
+        before = responses(root)
+        result = proc.run(harvest_command(engine, project, source, max_wait=max_wait, python=python),
+                          cwd=root, env=browser_env(), capture=False)
+        response = newest_new_response(root, before)
+    return ReviewOutcome(returncode=result.returncode, response=response)
 
 
 def run(engine: Path, project: Project, root: Path, prompt: str, *,

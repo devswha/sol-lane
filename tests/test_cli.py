@@ -135,3 +135,44 @@ def test_serve_refuses_a_public_bind_without_a_token(write_config, lane_repo: Pa
 def test_missing_config_is_a_config_error(tmp_path: Path, capsys):
     assert cli.main(["--config", str(tmp_path / "nope.toml"), "projects"]) == cli.EXIT_CONFIG
     assert "cannot read" in capsys.readouterr().err
+
+
+def test_a_failed_review_names_the_conversation_and_the_free_retry(
+        write_config, lane_repo: Path, project_root: Path, capsys, monkeypatch):
+    """A spent message must not become a lost one."""
+    config = write_config()
+    vendored_engine(lane_repo)
+    manifests = project_root / ".insane-review"
+    manifests.mkdir(exist_ok=True)
+    (manifests / "manifest_review_1.json").write_text(
+        '{"chat_url": "https://chatgpt.com/c/6a7d67cb-cfb4-83ee-b43f-b2b3d842bb47"}', encoding="utf-8")
+
+    from lane import review as review_module
+    monkeypatch.setattr(review_module, "cdp_up", lambda *a, **k: True)
+    monkeypatch.setattr(review_module, "run",
+                        lambda *a, **k: review_module.ReviewOutcome(returncode=1, response=None))
+
+    assert cli.main(["--config", str(config), "review", "demo", "audit"]) == cli.EXIT_DELIVERY
+    err = capsys.readouterr().err
+    assert "6a7d67cb-cfb4-83ee-b43f-b2b3d842bb47" in err
+    assert "lane harvest demo" in err
+
+
+def test_harvest_dry_run_sends_nothing(write_config, lane_repo: Path, capsys):
+    config = write_config()
+    vendored_engine(lane_repo)
+
+    assert cli.main(["--config", str(config), "harvest", "demo",
+                     "https://chatgpt.com/c/abcd1234-1111-2222-3333-444444444444",
+                     "--dry-run"]) == cli.EXIT_OK
+    out = capsys.readouterr().out
+    assert "--harvest https://chatgpt.com/c/abcd1234-1111-2222-3333-444444444444" in out
+    assert "--prompt" not in out and "--include" not in out
+
+
+def test_harvest_without_a_source_or_a_manifest_is_a_delivery_error(write_config, lane_repo: Path, capsys):
+    config = write_config()
+    vendored_engine(lane_repo)
+
+    assert cli.main(["--config", str(config), "harvest", "demo"]) == cli.EXIT_DELIVERY
+    assert "no run manifest" in capsys.readouterr().err
