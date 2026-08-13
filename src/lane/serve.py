@@ -28,7 +28,7 @@ from pathlib import Path
 
 from . import locks, proc
 from . import tools as tools_module
-from .review import browser_env
+from .review import browser_env, refusal_in
 
 ROLE_LABELS = {"system": "SYSTEM", "user": "USER", "assistant": "ASSISTANT", "tool": "TOOL"}
 TRANSCRIPT_HEADER = (
@@ -163,6 +163,12 @@ def run_engine(settings: ServeSettings, prompt: str) -> str:
     answer = result.stdout.strip()
     if not answer:
         raise ServeError("engine returned an empty answer (fail-closed)")
+    # The same false success `lane review` learned to reject: a refusal page is a
+    # delivered page, not a delivered answer. Here it would flow into a gjc agent
+    # loop as an assistant turn and be acted on.
+    refusal = refusal_in(answer)
+    if refusal is not None:
+        raise ServeError(f"engine delivered a page but not an answer — {refusal}")
     return answer
 
 

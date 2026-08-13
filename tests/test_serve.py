@@ -324,6 +324,14 @@ def test_run_engine_refuses_an_empty_answer(monkeypatch):
         serve_module.run_engine(SETTINGS, "prompt")
 
 
+def test_run_engine_refuses_a_refusal_page(monkeypatch):
+    """A refusal is a delivered page, not an answer a gjc agent loop may act on."""
+    stub_engine(monkeypatch, 0, stdout="이 콘텐츠는 표시할 수 없습니다\nTrusted Access\n")
+
+    with pytest.raises(serve_module.ServeError, match="refused"):
+        serve_module.run_engine(SETTINGS, "prompt")
+
+
 WEATHER_TOOL = {
     "type": "function",
     "function": {"name": "get_weather", "description": "weather for a city",
