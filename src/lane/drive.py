@@ -139,7 +139,8 @@ def implement(root: Path, plan: Path, *, first: bool, session: str | None = None
     return result.stdout.strip()
 
 
-def run_gate(root: Path, gate: str, *, env: Mapping[str, str] | None = None) -> tuple[bool, str]:
+def run_gate(root: Path, gate: str, *, env: Mapping[str, str] | None = None,
+             timeout: float | None = None) -> tuple[bool, str]:
     """Run the repository's own gate. Its exit code is the verdict.
 
     Only the tail is kept, and it is kept as it arrives: a test suite can print
@@ -149,7 +150,15 @@ def run_gate(root: Path, gate: str, *, env: Mapping[str, str] | None = None) -> 
     """
     environment = dict(env) if env is not None else proc.sanitized_env()
     try:
-        result = proc.run_tail(gate, cwd=root, shell=True, env=environment, limit=GATE_LOG_LIMIT)
+        result = proc.run_tail(gate, cwd=root, shell=True, env=environment,
+                              limit=GATE_LOG_LIMIT, timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        # A gate that hangs holds the drive lock, and that lock is what stops two
+        # drives from executing each other's plans in one worktree.
+        raise DriveError(
+            f"gate did not finish within {timeout:.0f}s and was killed; "
+            "no verdict was produced"
+        ) from error
     except (OSError, subprocess.SubprocessError) as error:
         raise DriveError(f"gate could not run: {error}") from error
     redacted, _ = redact_secrets(result.output)

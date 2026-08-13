@@ -12,8 +12,10 @@ signalled.
 from __future__ import annotations
 
 import os
+import selectors
 import signal
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -69,7 +71,7 @@ def run(command: list[str] | str, *, cwd: Path | None = None, env: dict[str, str
 
 
 def run_tail(command: list[str] | str, *, cwd: Path | None = None, env: dict[str, str] | None = None,
-             shell: bool = False, limit: int) -> Completed:
+             shell: bool = False, limit: int, timeout: float | None = None) -> Completed:
     """Run *command*, keeping only the last *limit* characters it printed.
 
     run() holds the child's entire output in memory and lets the caller slice a
@@ -80,29 +82,49 @@ def run_tail(command: list[str] | str, *, cwd: Path | None = None, env: dict[str
     """
     if limit < 1:
         raise ValueError("limit must be positive")
+    deadline = None if timeout is None else time.monotonic() + timeout
     with subprocess.Popen(command, cwd=cwd, env=env, shell=shell,
                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                           start_new_session=True) as process:
         try:
-            tail = _drain_tail(process.stdout, keep=limit * BYTES_PER_CHAR)
-            process.wait()
-        except BaseException:  # SIGINT, SIGTERM-turned-SystemExit
+            tail = _drain_tail(process.stdout, keep=limit * BYTES_PER_CHAR, deadline=deadline)
+            # The wait needs the deadline too: a child that closes its output and
+            # keeps running reaches EOF here and then never exits.
+            process.wait(None if deadline is None else max(deadline - time.monotonic(), 0.0))
+        except BaseException:  # timeout, SIGINT, SIGTERM-turned-SystemExit
             _stop(process)
             raise
     text = tail.decode("utf-8", "replace").strip()
     return Completed(returncode=process.returncode, stdout=text[-limit:], stderr="")
 
 
-def _drain_tail(stream, *, keep: int) -> bytes:
-    """Read *stream* to EOF holding at most ~2x *keep* bytes at any moment."""
+def _drain_tail(stream, *, keep: int, deadline: float | None = None) -> bytes:
+    """Read *stream* to EOF holding at most ~2x *keep* bytes at any moment.
+
+    With a deadline, a stream that goes quiet without closing cannot pin the
+    caller: the write end can outlive the child that was spawned with it.
+    """
     buffer = bytearray()
-    while True:
-        chunk = stream.read(READ_CHUNK_BYTES)
-        if not chunk:
-            return bytes(buffer[-keep:])
-        buffer += chunk
-        if len(buffer) > 2 * keep:
-            del buffer[:-keep]
+    selector = selectors.DefaultSelector() if deadline is not None else None
+    if selector is not None:
+        selector.register(stream, selectors.EVENT_READ)
+    try:
+        while True:
+            if selector is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not selector.select(remaining):
+                    raise subprocess.TimeoutExpired(cmd="run_tail", timeout=0)
+                chunk = stream.read1(READ_CHUNK_BYTES)
+            else:
+                chunk = stream.read(READ_CHUNK_BYTES)
+            if not chunk:
+                return bytes(buffer[-keep:])
+            buffer += chunk
+            if len(buffer) > 2 * keep:
+                del buffer[:-keep]
+    finally:
+        if selector is not None:
+            selector.close()
 
 
 def _stop(process: subprocess.Popen) -> None:

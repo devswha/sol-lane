@@ -399,3 +399,25 @@ def test_sealed_names_cover_the_runner_configuration():
     for name in ("conftest.py", "pyproject.toml", "uv.lock", ".python-version", "Makefile"):
         assert name in drive_module.GATE_SEALED_NAMES
     assert "test_thing.py" not in drive_module.GATE_SEALED_NAMES
+
+
+def test_a_hung_gate_is_killed_and_produces_no_verdict(tmp_path: Path):
+    """A gate that never finishes holds the drive lock, and that lock is the only
+    thing keeping two drives out of one worktree."""
+    with pytest.raises(drive_module.DriveError, match="did not finish within"):
+        drive_module.run_gate(tmp_path, "sleep 45", timeout=1.0)
+
+
+def test_gate_timeout_is_configurable_per_project(write_config):
+    project = config.load(write_config(extra="gate_timeout = 60\n")).project("demo")
+
+    assert project.gate_timeout == 60
+
+
+def test_gate_timeout_defaults_to_a_bound_not_to_forever(write_config):
+    assert config.load(write_config()).project("demo").gate_timeout == 1800
+
+
+def test_a_zero_gate_timeout_is_refused(write_config):
+    with pytest.raises(config.ConfigError, match="gate_timeout must be positive"):
+        config.load(write_config(extra="gate_timeout = 0\n"))

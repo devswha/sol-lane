@@ -67,6 +67,7 @@ class Project:
     no_project: bool
     delete_pack: bool
     gate_protected: tuple[str, ...]
+    gate_timeout: int
 
 
 @dataclass(frozen=True)
@@ -92,6 +93,7 @@ _DEFAULTS: dict[str, object] = {
     "no_project": True,
     "delete_pack": True,
     "gate_protected": DEFAULT_GATE_PROTECTED,
+    "gate_timeout": 1800,
 }
 
 
@@ -222,6 +224,9 @@ def _project(name: str, table: object, defaults: dict[str, object]) -> Project:
     merged = {**defaults, **{key: table[key] for key in _DEFAULTS if key in table}}
     force_answer_after = _non_negative_int(merged["force_answer_after"], name, "force_answer_after")
     max_wait = _non_negative_int(merged["max_wait"], name, "max_wait")
+    gate_timeout = _non_negative_int(merged["gate_timeout"], name, "gate_timeout")
+    if gate_timeout <= 0:
+        raise ConfigError(f"[projects.{name}] gate_timeout must be positive")
     if max_wait <= 0:
         raise ConfigError(f"[projects.{name}] max_wait must be positive")
     if force_answer_after and force_answer_after >= max_wait:
@@ -239,6 +244,7 @@ def _project(name: str, table: object, defaults: dict[str, object]) -> Project:
         no_project=bool(merged["no_project"]),
         delete_pack=bool(merged["delete_pack"]),
         gate_protected=_glob_tuple(merged["gate_protected"], name, "gate_protected"),
+        gate_timeout=gate_timeout,
     )
 
 

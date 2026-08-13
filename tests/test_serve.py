@@ -402,7 +402,11 @@ def test_a_stream_carries_the_call_and_closes_on_tool_calls(server):
     frames = [json.loads(line.removeprefix("data: ")) for line in response.read().decode().splitlines()
               if line.startswith("data: ") and "[DONE]" not in line]
 
-    assert frames[0]["choices"][0]["delta"]["tool_calls"][0]["function"]["name"] == "get_weather"
+    # The first frames are heartbeats held open while Pro reasons; the call
+    # arrives in whichever frame carries a delta with tool_calls in it.
+    carrying = [frame for frame in frames if frame["choices"][0].get("delta", {}).get("tool_calls")]
+    assert len(carrying) == 1, "the call is announced once, not per heartbeat"
+    assert carrying[0]["choices"][0]["delta"]["tool_calls"][0]["function"]["name"] == "get_weather"
     assert frames[-1]["choices"][0]["finish_reason"] == "tool_calls"
 
 

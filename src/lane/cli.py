@@ -19,6 +19,7 @@ from . import engine as engine_module
 from . import locks, proc
 from . import paste as paste_module
 from . import review as review_module
+from . import salvage as salvage_module
 from . import serve as serve_module
 from .config import Config, ConfigError, checked_root, find_config, load, secret_markers_in
 
@@ -55,6 +56,12 @@ def build_parser() -> argparse.ArgumentParser:
                          help="seconds to wait for the answer (raise it when Pro is still thinking)")
     harvest.add_argument("--dry-run", action="store_true", help="print the command instead of running it")
 
+    salvage = sub.add_parser(
+        "salvage", help="take whatever an interrupted conversation still shows (unverified)")
+    salvage.add_argument("project")
+    salvage.add_argument("source", nargs="?",
+                         help="conversation URL or manifest path (default: this project's newest run)")
+
     sub.add_parser("projects", help="list configured projects")
     sub.add_parser("doctor", help="check engine, browser, and project roots")
 
@@ -88,12 +95,14 @@ def main(argv: list[str] | None = None) -> int:
             return _drive(config, args)
         if args.command == "harvest":
             return _harvest(config, args)
+        if args.command == "salvage":
+            return _salvage(config, args)
         return _review(config, args)
     except (ConfigError, engine_module.EngineError) as error:
         print(f"lane: {error}", file=sys.stderr)
         return EXIT_CONFIG
     except (paste_module.PasteError, review_module.ReviewError, drive_module.DriveError,
-            locks.LockBusy) as error:
+            salvage_module.SalvageError, locks.LockBusy) as error:
         print(f"lane: {error}", file=sys.stderr)
         return EXIT_DELIVERY
 
@@ -234,9 +243,42 @@ def _drive_loop(config: Config, args, project, root: Path, include, engine_path:
         max_iters=args.max_iters,
         planner=lambda prompt: review_module.ask(engine_path, project, root, prompt, include=include),
         implementer=lambda plan, first: drive_module.implement(root, plan, first=first, session=args.session),
-        gate_runner=lambda: drive_module.run_gate(root, project.gate),
+        gate_runner=lambda: drive_module.run_gate(root, project.gate,
+                                                  timeout=project.gate_timeout),
         protected=project.gate_protected,
     )
+
+
+def _conversation_source(project, root: Path, explicit: str | None) -> str:
+    """A conversation URL, from the argument or from this project's newest run."""
+    if explicit:
+        return explicit
+    manifest = review_module.newest_manifest(root)
+    if manifest is None:
+        raise review_module.ReviewError(
+            f"no run manifest under {root / '.insane-review'} for {project.name}")
+    return str(manifest)
+
+
+def _salvage(config: Config, args: argparse.Namespace) -> int:
+    project = config.project(args.project)
+    root = checked_root(project)
+    source = _conversation_source(project, root, args.source)
+    url = source
+    if not source.startswith("http"):
+        found = review_module.conversation_of(Path(source))
+        if found is None:
+            raise salvage_module.SalvageError(f"no conversation URL in {source}")
+        url = found
+
+    outcome = salvage_module.salvage(url, root / ".insane-review")
+    print(f"salvaged   {outcome.path}")
+    print(f"           {outcome.chars} chars, {outcome.assistant_turns} assistant turn(s)"
+          f"{', still streaming' if outcome.streaming else ''}")
+    if outcome.assistant_turns == 0:
+        print("           no assistant message: this is reasoning narration, not an answer",
+              file=sys.stderr)
+    return EXIT_OK
 
 
 def _report_pack_size(root: Path, globs: tuple[str, ...]) -> None:
@@ -303,6 +345,8 @@ def _print_harvest_hint(root: Path, project: str) -> None:
         return
     print(f"chat       {conversation}", file=sys.stderr)
     print(f"retry      lane harvest {project}   # no new message is sent", file=sys.stderr)
+    print(f"salvage    lane salvage {project}   # unverified: whatever the page still shows",
+          file=sys.stderr)
 
 
 def _harvest(config: Config, args: argparse.Namespace) -> int:
@@ -310,13 +354,7 @@ def _harvest(config: Config, args: argparse.Namespace) -> int:
     root = checked_root(project)
     engine_path = _engine(config)
 
-    source = args.source
-    if source is None:
-        manifest = review_module.newest_manifest(root)
-        if manifest is None:
-            raise review_module.ReviewError(
-                f"no run manifest under {root / '.insane-review'} to harvest from")
-        source = str(manifest)
+    source = _conversation_source(project, root, args.source)
 
     if args.dry_run:
         print(" ".join(review_module.harvest_command(engine_path, project, source,

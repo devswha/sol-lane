@@ -186,7 +186,7 @@ def test_run_tail_rejects_an_unbounded_limit():
 def test_an_interrupted_tail_call_kills_the_child_too(monkeypatch):
     assert not marker_alive()
 
-    def interrupted(stream, *, keep):
+    def interrupted(stream, *, keep, deadline=None):
         raise KeyboardInterrupt
 
     monkeypatch.setattr(proc, "_drain_tail", interrupted)
@@ -199,3 +199,48 @@ def test_an_interrupted_tail_call_kills_the_child_too(monkeypatch):
             break
         time.sleep(0.1)
     assert not marker_alive(), "the child outlived the tail call"
+
+
+def test_run_tail_kills_a_child_that_closes_its_output_and_keeps_living():
+    """Sol Pro, 2026-08-13, reviewing this very function: the memory bound holds,
+    but "자식이 EOF를 주지 않거나 출력 FD를 닫고 계속 살면 read()/wait()가 무기한
+    멈출 수는 있다". EOF arrives, then wait() never returns."""
+    script = f"import os, time; os.close(1); os.close(2); time.sleep(45)  # {MARKER}"
+
+    started = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired):
+        proc.run_tail(["python3", "-c", script], limit=4000, timeout=1.0)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 20, f"the wait was not bounded ({elapsed:.1f}s)"
+    for _ in range(20):
+        if not marker_alive():
+            break
+        time.sleep(0.1)
+    assert not marker_alive(), "the child outlived the timeout"
+
+
+def test_run_tail_times_out_on_a_stream_that_goes_quiet_without_closing():
+    """A write end can outlive the child that was spawned with it."""
+    script = (f"sleep 45 & echo first; wait  # {MARKER}")
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        proc.run_tail(script, shell=True, limit=4000, timeout=1.0)
+
+    for _ in range(20):
+        if not marker_alive():
+            break
+        time.sleep(0.1)
+    assert not marker_alive()
+
+
+def test_run_tail_without_a_timeout_still_reads_to_eof():
+    result = proc.run_tail("echo bounded", shell=True, limit=4000)
+
+    assert result.output == "bounded"
+
+
+def test_run_tail_with_a_timeout_that_is_not_reached_returns_normally():
+    result = proc.run_tail("echo quick", shell=True, limit=4000, timeout=30)
+
+    assert (result.returncode, result.output) == (0, "quick")
