@@ -18,6 +18,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 TERMINATE_GRACE_SECONDS = 10.0
+# Read size for the tail path. Peak memory there is this plus twice the kept tail.
+READ_CHUNK_BYTES = 65536
+# Widest UTF-8 encoding of one character: how many bytes a kept character costs.
+BYTES_PER_CHAR = 4
 
 # A gate inherits nothing it was not given: its output is fed back into the next
 # Sol Pro prompt, so an inherited token can leave the machine through a stack
@@ -62,6 +66,43 @@ def run(command: list[str] | str, *, cwd: Path | None = None, env: dict[str, str
             _stop(process)
             raise
     return Completed(returncode=process.returncode, stdout=stdout or "", stderr=stderr or "")
+
+
+def run_tail(command: list[str] | str, *, cwd: Path | None = None, env: dict[str, str] | None = None,
+             shell: bool = False, limit: int) -> Completed:
+    """Run *command*, keeping only the last *limit* characters it printed.
+
+    run() holds the child's entire output in memory and lets the caller slice a
+    tail off afterwards; a gate that prints a gigabyte of test log takes the lane
+    down before that slice happens. Here stdout and stderr are merged in the
+    order they arrive, consumed in fixed-size chunks, and everything but the tail
+    is dropped as it comes in.
+    """
+    if limit < 1:
+        raise ValueError("limit must be positive")
+    with subprocess.Popen(command, cwd=cwd, env=env, shell=shell,
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          start_new_session=True) as process:
+        try:
+            tail = _drain_tail(process.stdout, keep=limit * BYTES_PER_CHAR)
+            process.wait()
+        except BaseException:  # SIGINT, SIGTERM-turned-SystemExit
+            _stop(process)
+            raise
+    text = tail.decode("utf-8", "replace").strip()
+    return Completed(returncode=process.returncode, stdout=text[-limit:], stderr="")
+
+
+def _drain_tail(stream, *, keep: int) -> bytes:
+    """Read *stream* to EOF holding at most ~2x *keep* bytes at any moment."""
+    buffer = bytearray()
+    while True:
+        chunk = stream.read(READ_CHUNK_BYTES)
+        if not chunk:
+            return bytes(buffer[-keep:])
+        buffer += chunk
+        if len(buffer) > 2 * keep:
+            del buffer[:-keep]
 
 
 def _stop(process: subprocess.Popen) -> None:

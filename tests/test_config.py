@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from lane.config import (
+    DEFAULT_GATE_PROTECTED,
     ConfigError,
     assert_safe_pack,
     checked_root,
@@ -157,3 +158,21 @@ def test_find_config_walks_upwards(lane_repo: Path, write_config):
 def test_find_config_fails_when_absent(tmp_path: Path):
     with pytest.raises(ConfigError, match="no lane.toml"):
         find_config(tmp_path)
+
+
+def test_gate_protected_defaults_to_the_verification_files(write_config):
+    project = load(write_config()).project("demo")
+
+    assert project.gate_protected == tuple(DEFAULT_GATE_PROTECTED)
+    assert "tests/**/*" in project.gate_protected
+
+
+def test_gate_protected_can_be_replaced_per_project(write_config):
+    project = load(write_config(extra='gate_protected = ["spec/**/*", "vitest.config.ts"]\n')).project("demo")
+
+    assert project.gate_protected == ("spec/**/*", "vitest.config.ts")
+
+
+def test_gate_protected_must_be_a_list_of_globs(write_config):
+    with pytest.raises(ConfigError, match="gate_protected must be a list of non-empty globs"):
+        load(write_config(extra='gate_protected = "tests"\n'))

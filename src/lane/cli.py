@@ -198,6 +198,8 @@ def _drive(config: Config, args: argparse.Namespace) -> int:
                                              include=include, council=True)))
         print(" ".join(drive_module.implement_command(root, plan, first=True, session=args.session)))
         print(project.gate)
+        frozen = drive_module.gate_digests(root, project.gate, project.gate_protected)
+        print(f"# frozen verification: {len(frozen)} file(s)")
         return EXIT_OK
 
     # One plan file, one gjc session directory, one worktree: two drives in the
@@ -223,6 +225,7 @@ def _drive_loop(config: Config, args, project, root: Path, include, engine_path:
         planner=lambda prompt: review_module.ask(engine_path, project, root, prompt, include=include),
         implementer=lambda plan, first: drive_module.implement(root, plan, first=first, session=args.session),
         gate_runner=lambda: drive_module.run_gate(root, project.gate),
+        protected=project.gate_protected,
     )
 
 

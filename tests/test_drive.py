@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from lane import config
 from lane import drive as drive_module
 
 
@@ -107,7 +108,7 @@ def test_a_passing_gate_ends_the_loop_after_one_consultation(tmp_path: Path):
     prompts, firsts, planner, implementer, gate_runner = make_loop([(True, "ok")], tmp_path)
 
     outcome = drive_module.drive(tmp_path, "task", "gate", max_iters=3, planner=planner,
-                                 implementer=implementer, gate_runner=gate_runner,
+                                 implementer=implementer, gate_runner=gate_runner, protected=(),
                                  log=lambda *_: None, fingerprint=changing())
 
     assert outcome.passed is True
@@ -121,7 +122,7 @@ def test_a_failing_gate_feeds_its_output_into_the_next_plan(tmp_path: Path):
         [(False, "E   assert 1 == 2"), (True, "ok")], tmp_path)
 
     outcome = drive_module.drive(tmp_path, "task", "uv run pytest -q", max_iters=3, planner=planner,
-                                 implementer=implementer, gate_runner=gate_runner,
+                                 implementer=implementer, gate_runner=gate_runner, protected=(),
                                  log=lambda *_: None, fingerprint=changing())
 
     assert outcome.passed is True
@@ -135,7 +136,7 @@ def test_the_loop_stops_at_max_iters_and_reports_failure(tmp_path: Path):
         [(False, "fail 1"), (False, "fail 2")], tmp_path)
 
     outcome = drive_module.drive(tmp_path, "task", "gate", max_iters=2, planner=planner,
-                                 implementer=implementer, gate_runner=gate_runner,
+                                 implementer=implementer, gate_runner=gate_runner, protected=(),
                                  log=lambda *_: None, fingerprint=changing())
 
     assert outcome.passed is False
@@ -147,14 +148,15 @@ def test_the_loop_stops_at_max_iters_and_reports_failure(tmp_path: Path):
 def test_max_iters_below_one_is_rejected(tmp_path: Path):
     with pytest.raises(drive_module.DriveError, match="at least 1"):
         drive_module.drive(tmp_path, "task", "gate", max_iters=0, planner=lambda p: "",
-                           implementer=lambda *a: None, gate_runner=lambda: (True, ""))
+                           implementer=lambda *a: None, gate_runner=lambda: (True, ""),
+                           protected=())
 
 
 def test_the_plan_file_holds_the_latest_plan(tmp_path: Path):
     _, _, planner, implementer, gate_runner = make_loop([(False, "f"), (True, "ok")], tmp_path)
 
     drive_module.drive(tmp_path, "task", "gate", max_iters=2, planner=planner,
-                       implementer=implementer, gate_runner=gate_runner,
+                       implementer=implementer, gate_runner=gate_runner, protected=(),
                        log=lambda *_: None, fingerprint=changing())
 
     assert (tmp_path / drive_module.PLAN_RELPATH).read_text(encoding="utf-8") == "plan 2\n"
@@ -166,7 +168,7 @@ def test_an_already_green_gate_is_reported_instead_of_claimed_as_work(tmp_path: 
     outcome = drive_module.drive(tmp_path, "task", "gate", max_iters=3,
                                  planner=lambda prompt: calls.append(prompt) or "plan",
                                  implementer=lambda *a: calls.append("implement"),
-                                 gate_runner=lambda: (True, "green"),
+                                 gate_runner=lambda: (True, "green"), protected=(),
                                  log=lambda *_: None, fingerprint=changing())
 
     assert outcome.already_satisfied is True
@@ -180,7 +182,7 @@ def test_an_implementation_that_changes_nothing_is_not_a_pass(tmp_path: Path):
 
     with pytest.raises(drive_module.DriveError, match="no repository change"):
         drive_module.drive(tmp_path, "task", "gate", max_iters=2, planner=planner,
-                           implementer=implementer, gate_runner=gate_runner,
+                           implementer=implementer, gate_runner=gate_runner, protected=(),
                            log=lambda *_: None, fingerprint=lambda root: "same")
 
 
@@ -191,7 +193,7 @@ def test_an_empty_plan_is_refused_before_anything_runs(tmp_path: Path):
         drive_module.drive(tmp_path, "task", "gate", max_iters=2,
                            planner=lambda prompt: "   \n ",
                            implementer=lambda *a: implemented.append(a),
-                           gate_runner=lambda: (False, "red"),
+                           gate_runner=lambda: (False, "red"), protected=(),
                            log=lambda *_: None, fingerprint=changing())
     assert implemented == []
 
@@ -241,3 +243,92 @@ def test_run_gate_does_not_leak_the_parent_environment(tmp_path: Path, monkeypat
     assert passed is False
     assert "super-secret-value" not in log
     assert "[]" in log
+
+
+def make_verified_repo(root: Path) -> None:
+    """A repo whose gate depends on a test file, a conftest, and pyproject."""
+    (root / "tests").mkdir()
+    (root / "tests" / "test_thing.py").write_text("def test_thing():\n    assert False\n", encoding="utf-8")
+    (root / "tests" / "conftest.py").write_text("", encoding="utf-8")
+    (root / "pyproject.toml").write_text("[tool.pytest.ini_options]\n", encoding="utf-8")
+    (root / "src.py").write_text("value = 1\n", encoding="utf-8")
+
+
+def test_gate_digests_cover_the_verification_and_nothing_else(tmp_path: Path):
+    make_verified_repo(tmp_path)
+    cache = tmp_path / "tests" / "__pycache__"
+    cache.mkdir()
+    (cache / "test_thing.cpython-312.pyc").write_bytes(b"\x00")
+
+    digests = drive_module.gate_digests(tmp_path, "uv run pytest -q", config.DEFAULT_GATE_PROTECTED)
+
+    assert set(digests) == {"tests/test_thing.py", "tests/conftest.py", "pyproject.toml"}, (
+        "source is fair game, generated bytecode is noise"
+    )
+
+
+def test_gate_digests_include_a_gate_script_no_glob_would_name(tmp_path: Path):
+    script = tmp_path / "run-gate.sh"
+    script.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+
+    digests = drive_module.gate_digests(tmp_path, "./run-gate.sh --verbose", ())
+
+    assert "run-gate.sh" in digests
+
+
+def test_gate_tampering_reports_rewrites_and_deletions_but_allows_new_files():
+    before = {"tests/a.py": "aaa", "tests/b.py": "bbb"}
+    after = {"tests/a.py": "changed", "tests/c.py": "new"}
+
+    assert drive_module.gate_tampering(before, after) == ["tests/a.py (rewritten)", "tests/b.py (deleted)"]
+    assert drive_module.gate_tampering(before, {**before, "tests/c.py": "new"}) == []
+
+
+def test_deleting_the_failing_test_fails_the_drive_without_running_the_gate(tmp_path: Path):
+    make_verified_repo(tmp_path)
+    gate_calls = []
+
+    def gate_runner():
+        gate_calls.append(1)
+        return (False, "red before work") if len(gate_calls) == 1 else (True, "no tests ran")
+
+    def implementer(plan, first):
+        (tmp_path / "tests" / "test_thing.py").unlink()
+
+    with pytest.raises(drive_module.DriveError, match=r"tests/test_thing.py \(deleted\)"):
+        drive_module.drive(tmp_path, "task", "uv run pytest -q", max_iters=2,
+                           planner=lambda prompt: "plan", implementer=implementer,
+                           gate_runner=gate_runner, protected=config.DEFAULT_GATE_PROTECTED,
+                           log=lambda *_: None)
+    assert gate_calls == [1], "the pre-flight gate ran; the verdict gate never got the chance"
+
+
+def test_excluding_the_test_in_pyproject_fails_the_drive(tmp_path: Path):
+    make_verified_repo(tmp_path)
+
+    def implementer(plan, first):
+        (tmp_path / "pyproject.toml").write_text(
+            '[tool.pytest.ini_options]\naddopts = "--ignore=tests"\n', encoding="utf-8")
+
+    with pytest.raises(drive_module.DriveError, match=r"pyproject.toml \(rewritten\)"):
+        drive_module.drive(tmp_path, "task", "uv run pytest -q", max_iters=2,
+                           planner=lambda prompt: "plan", implementer=implementer,
+                           gate_runner=lambda: (False, "red"), protected=config.DEFAULT_GATE_PROTECTED,
+                           log=lambda *_: None)
+
+
+def test_an_implementation_that_adds_a_test_and_fixes_the_source_passes(tmp_path: Path):
+    make_verified_repo(tmp_path)
+    results = iter([(False, "red before work"), (True, "ok")])
+
+    def implementer(plan, first):
+        (tmp_path / "src.py").write_text("value = 2\n", encoding="utf-8")
+        (tmp_path / "tests" / "test_more.py").write_text("def test_more():\n    pass\n", encoding="utf-8")
+
+    outcome = drive_module.drive(tmp_path, "task", "uv run pytest -q", max_iters=2,
+                                 planner=lambda prompt: "plan", implementer=implementer,
+                                 gate_runner=lambda: next(results),
+                                 protected=config.DEFAULT_GATE_PROTECTED, log=lambda *_: None)
+
+    assert outcome.passed is True
+    assert outcome.iterations == 1

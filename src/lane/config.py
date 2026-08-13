@@ -25,6 +25,14 @@ SECRET_NAME_PATTERNS = (
 )
 SECRET_DIR_PREFIXES = ("artifacts/private",)
 
+# `lane drive` freezes these before it lets an implementer near the worktree:
+# the gate decides the verdict, so editing the gate is the cheapest way to fake
+# one. Repos that verify differently override this per project.
+DEFAULT_GATE_PROTECTED = [
+    "tests/**/*", "**/conftest.py", "pyproject.toml", "pytest.ini",
+    "setup.cfg", "tox.ini", "noxfile.py", "Makefile",
+]
+
 _REPO_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 
@@ -55,6 +63,7 @@ class Project:
     max_wait: int
     no_project: bool
     delete_pack: bool
+    gate_protected: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -79,6 +88,7 @@ _DEFAULTS: dict[str, object] = {
     "max_wait": 1200,
     "no_project": True,
     "delete_pack": True,
+    "gate_protected": DEFAULT_GATE_PROTECTED,
 }
 
 
@@ -225,7 +235,14 @@ def _project(name: str, table: object, defaults: dict[str, object]) -> Project:
         max_wait=max_wait,
         no_project=bool(merged["no_project"]),
         delete_pack=bool(merged["delete_pack"]),
+        gate_protected=_glob_tuple(merged["gate_protected"], name, "gate_protected"),
     )
+
+
+def _glob_tuple(value: object, project: str, key: str) -> tuple[str, ...]:
+    if not isinstance(value, list) or not all(isinstance(item, str) and item.strip() for item in value):
+        raise ConfigError(f"[projects.{project}] {key} must be a list of non-empty globs")
+    return tuple(item.strip() for item in value)
 
 
 def _non_negative_int(value: object, project: str, key: str) -> int:

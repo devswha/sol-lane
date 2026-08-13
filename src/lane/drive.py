@@ -13,16 +13,19 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shlex
 import subprocess
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 from . import proc
 
 # Lane-owned and machine-generated paths change on every run; they must not
-# count as "the implementation did something".
-FINGERPRINT_IGNORED = (".git", ".ai-bridge", ".insane-review", ".venv", "__pycache__", ".pytest_cache")
+# count as "the implementation did something", nor as verification tampering.
+GENERATED_PATHS = (".git", ".ai-bridge", ".insane-review", ".venv", "__pycache__", ".pytest_cache")
+GENERATED_SUFFIXES = (".pyc", ".pyo")
+HASH_CHUNK_BYTES = 131072
 # Redacting shorter values would turn ordinary words into noise.
 MIN_REDACTED_SECRET = 8
 
@@ -129,16 +132,17 @@ def implement(root: Path, plan: Path, *, first: bool, session: str | None = None
 def run_gate(root: Path, gate: str, *, env: Mapping[str, str] | None = None) -> tuple[bool, str]:
     """Run the repository's own gate. Its exit code is the verdict.
 
-    The environment is an allowlist because this output is forwarded to Sol Pro
-    in the retry prompt, and anything still recognisable as a live secret is
-    redacted before it can travel.
+    Only the tail is kept, and it is kept as it arrives: a test suite can print
+    more log than this machine has memory. The environment is an allowlist
+    because this output is forwarded to Sol Pro in the retry prompt, and anything
+    still recognisable as a live secret is redacted before it can travel.
     """
     environment = dict(env) if env is not None else proc.sanitized_env()
     try:
-        result = proc.run(gate, cwd=root, shell=True, env=environment)
+        result = proc.run_tail(gate, cwd=root, shell=True, env=environment, limit=GATE_LOG_LIMIT)
     except (OSError, subprocess.SubprocessError) as error:
         raise DriveError(f"gate could not run: {error}") from error
-    redacted, _ = redact_secrets(result.output[-GATE_LOG_LIMIT:])
+    redacted, _ = redact_secrets(result.output)
     return result.returncode == 0, redacted
 
 
@@ -154,7 +158,71 @@ def redact_secrets(text: str, env: Mapping[str, str] | None = None) -> tuple[str
     return redacted, hits
 
 
-def worktree_fingerprint(root: Path, *, ignored: tuple[str, ...] = FINGERPRINT_IGNORED) -> str:
+def gate_digests(root: Path, gate: str, globs: Sequence[str]) -> dict[str, str]:
+    """sha256 of every existing file the gate's verdict depends on.
+
+    The implementer and the gate share one mutable worktree, so "make the gate
+    pass" can be satisfied by deleting the failing test, excluding it in
+    pyproject.toml, or rewriting the gate script. Nothing in the prompt can stop
+    that; a hash taken before the implementation runs can.
+    """
+    digests: dict[str, str] = {}
+    for pattern in (*globs, *_gate_command_files(root, gate)):
+        for path in root.glob(pattern):
+            relative = path.relative_to(root)
+            if any(part in GENERATED_PATHS for part in relative.parts):
+                continue
+            if path.suffix in GENERATED_SUFFIXES or not path.is_file():
+                continue
+            digests[relative.as_posix()] = _file_digest(path)
+    return digests
+
+
+def _file_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(HASH_CHUNK_BYTES), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _gate_command_files(root: Path, gate: str) -> list[str]:
+    """Tokens of the gate command that name a file inside the repository.
+
+    `./scripts/gate.sh` is as much the verification as the tests it runs, and no
+    glob list will know its name.
+    """
+    try:
+        tokens = shlex.split(gate)
+    except ValueError:
+        return []
+    files = []
+    for token in tokens:
+        if not token or token.startswith(("-", "/")):
+            continue
+        relative = Path(token)
+        if ".." in relative.parts or not (root / relative).is_file():
+            continue
+        files.append(relative.as_posix())
+    return files
+
+
+def gate_tampering(before: Mapping[str, str], after: Mapping[str, str]) -> list[str]:
+    """Protected paths the implementation rewrote or removed.
+
+    Only files that existed when the drive started are frozen: adding a test
+    cannot turn a red gate green, so new files are allowed.
+    """
+    problems = []
+    for path, digest in sorted(before.items()):
+        if path not in after:
+            problems.append(f"{path} (deleted)")
+        elif after[path] != digest:
+            problems.append(f"{path} (rewritten)")
+    return problems
+
+
+def worktree_fingerprint(root: Path, *, ignored: tuple[str, ...] = GENERATED_PATHS) -> str:
     """Cheap identity of the tree, used to detect an implementation that did nothing."""
     digest = hashlib.sha256()
     for path in sorted(root.rglob("*")):
@@ -170,7 +238,7 @@ def worktree_fingerprint(root: Path, *, ignored: tuple[str, ...] = FINGERPRINT_I
 
 
 def drive(root: Path, intent: str, gate: str, *, max_iters: int, planner, implementer, gate_runner,
-          log=print, fingerprint=worktree_fingerprint) -> DriveOutcome:
+          protected: Sequence[str], log=print, fingerprint=worktree_fingerprint) -> DriveOutcome:
     """One planning consultation per attempt; the gate ends the loop."""
     if max_iters < 1:
         raise DriveError("max_iters must be at least 1")
@@ -181,6 +249,9 @@ def drive(root: Path, intent: str, gate: str, *, max_iters: int, planner, implem
     if gate_runner()[0]:
         log(f"[0/{max_iters}] gate already passes — nothing to drive")
         return DriveOutcome(passed=True, attempts=(), already_satisfied=True)
+
+    baseline = gate_digests(root, gate, protected)
+    log(f"[0/{max_iters}] verification frozen: {len(baseline)} file(s) the implementation may not rewrite")
 
     attempts: list[Attempt] = []
     failure: str | None = None
@@ -199,6 +270,14 @@ def drive(root: Path, intent: str, gate: str, *, max_iters: int, planner, implem
             raise DriveError(
                 "implementation produced no repository change; "
                 "a gate verdict now would describe the previous state"
+            )
+        tampering = gate_tampering(baseline, gate_digests(root, gate, protected))
+        if tampering:
+            raise DriveError(
+                "the implementation changed the verification it was supposed to satisfy: "
+                + ", ".join(tampering[:5])
+                + (f" (+{len(tampering) - 5} more)" if len(tampering) > 5 else "")
+                + "; the gate was not run"
             )
 
         log(f"[{iteration}/{max_iters}] gate: {gate}")

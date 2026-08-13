@@ -4,6 +4,7 @@ import os
 import signal
 import subprocess
 import time
+import tracemalloc
 
 import pytest
 
@@ -144,3 +145,57 @@ def test_sigterm_becomes_system_exit_so_cleanup_runs():
         assert caught.value.code == 128 + signal.SIGTERM
     finally:
         signal.signal(signal.SIGTERM, previous)
+
+
+FLOOD = "python3 -c \"import sys; [sys.stdout.write('x' * 1000000) for _ in range(64)]\""
+
+
+def test_run_tail_keeps_the_tail_of_both_streams():
+    result = proc.run_tail("echo out; echo err >&2; exit 2", shell=True, limit=4000)
+
+    assert result.returncode == 2
+    assert result.output.splitlines() == ["out", "err"]
+
+
+def test_run_tail_returns_exactly_the_last_characters():
+    result = proc.run_tail("python3 -c \"print('ab' * 5000)\"", shell=True, limit=100)
+
+    assert result.output == "ab" * 50
+
+
+def test_run_tail_memory_does_not_grow_with_the_childs_output():
+    """A gate can print more log than this machine has memory; run() would hold
+    all 64 MB of it before the caller sliced a 4 KB tail off."""
+    tracemalloc.start()
+    try:
+        result = proc.run_tail(FLOOD, shell=True, limit=4000)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+
+    assert result.returncode == 0
+    assert len(result.output) == 4000
+    assert peak < 4 * 1024 * 1024, f"held {peak} bytes of a 64 MB output"
+
+
+def test_run_tail_rejects_an_unbounded_limit():
+    with pytest.raises(ValueError, match="limit must be positive"):
+        proc.run_tail("echo hi", shell=True, limit=0)
+
+
+def test_an_interrupted_tail_call_kills_the_child_too(monkeypatch):
+    assert not marker_alive()
+
+    def interrupted(stream, *, keep):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(proc, "_drain_tail", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        proc.run_tail(SLEEPER, limit=4000)
+    monkeypatch.undo()
+
+    for _ in range(20):
+        if not marker_alive():
+            break
+        time.sleep(0.1)
+    assert not marker_alive(), "the child outlived the tail call"

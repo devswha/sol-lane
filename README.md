@@ -53,6 +53,22 @@ lane drive ea "<하고 싶은 일>" [--max-iters 2] [--session <sdk-session-id>]
 구현은 **lane 전용 세션 디렉토리**(`.ai-bridge/lane-session`)에서 돈다. 네가 쓰고 있는
  live 세션에 프롬프트가 주입될 일이 없다 — 그러려면 `--session <id>`로 명시해야 한다.
 
+### 게이트를 고쳐서 게이트를 통과할 수는 없다
+
+구현자와 게이트는 같은 워크트리를 공유하므로, "게이트를 통과시켜라"는 실패 테스트
+삭제·`addopts = --ignore=tests`·게이트 스크립트 `exit 0`으로도 만족된다. 프롬프트의
+금지 문구로는 막을 수 없어서, 드라이브 시작 시점에 **검증 파일들의 해시를 얼린다.**
+
+- 대상: `gate_protected` 글롭(기본 `tests/**/*`, `**/conftest.py`, `pyproject.toml`,
+  `pytest.ini`, `setup.cfg`, `tox.ini`, `noxfile.py`, `Makefile`) + 게이트 커맨드가
+  실제로 가리키는 레포 내 파일(`./scripts/gate.sh` 같은 것).
+- 구현 후 하나라도 수정·삭제됐으면 **게이트를 실행하지 않고** 실패한다. 이미 초록인
+  게이트를 물려받아 성공으로 보고할 여지를 남기지 않는다.
+- 파일 추가는 허용된다. 빨간 게이트는 테스트를 더 넣어도 초록이 되지 않는다.
+
+게이트 출력은 도착하는 대로 tail(`GATE_LOG_LIMIT`)만 남긴다. 수 GB를 찍는 테스트
+스위트가 lane을 OOM으로 끌고 가지 못한다.
+
 ## Sol Pro 모드 — gjc 세션을 Pro로 돌리기
 
 ```bash
@@ -86,6 +102,7 @@ profiles:
 [projects.ea]
 root = "~/workspace/ea-sol-wt"
 include = ["README.md", "src/ea/**/*.py", "tests/**/*.py"]
+gate = "uv run pytest -q"          # lane drive의 판정자
 force_answer_after = 600
 ```
 
