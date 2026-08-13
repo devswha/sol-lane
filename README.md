@@ -232,6 +232,18 @@ stderr에 경고를 찍는다.
 - `--require-model`로 모델을 검증하고, 불일치·첨부 실패·빈 응답·거절 페이지·프롬프트
   메아리는 저장하지 않는다.
 
+## 테스트
+
+```bash
+uv run pytest -q        # 단위 + 샌드박스 전부 — Pro 메시지 0통, 브라우저 불필요
+```
+
+`tests/test_sandbox.py`는 프로세스 경계를 실물로 건넌다: 스텁 엔진 서브프로세스
+(`LANE_ENGINE` 봉합선), 실제 HTTP 소켓의 serve, PATH의 가짜 `gjc` 실행파일, 실제
+게이트 프로세스. 돈이 드는 두 가지(Pro 호출, CDP 브라우저)만 가짜다. 유일하게
+샌드박스로 검증 불가능한 것은 ChatGPT DOM 자체 — 그건 `lane review <proj> "<질문>"`
+한 판이 곧 live 테스트다.
+
 ## 문서
 
 - [docs/sol-pro-mode.md](docs/sol-pro-mode.md) — gjc 통합 계약과 실측
