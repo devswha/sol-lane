@@ -39,6 +39,26 @@ def test_implement_uses_a_lane_owned_session_directory(tmp_path: Path):
     assert "--continue" not in command, "the first attempt starts a fresh session"
 
 
+def test_implement_bounds_a_gjc_that_never_exits(tmp_path: Path, monkeypatch):
+    """A hung gjc must not hold the drive lock forever. Measured 2026-08-13: a
+    tool-executing `gjc -p` kept running minutes past its final output."""
+    import subprocess
+
+    seen = {}
+
+    def hang(command, **kwargs):
+        seen["timeout"] = kwargs.get("timeout")
+        raise subprocess.TimeoutExpired(cmd=command, timeout=kwargs.get("timeout"))
+
+    monkeypatch.setattr(drive_module.proc, "run", hang)
+    plan = tmp_path / "plan.md"
+    plan.write_text("plan", encoding="utf-8")
+
+    with pytest.raises(drive_module.DriveError, match="did not finish within"):
+        drive_module.implement(tmp_path, plan, first=True)
+    assert seen["timeout"] == drive_module.IMPLEMENT_TIMEOUT_SECONDS
+
+
 def test_later_attempts_continue_the_same_session(tmp_path: Path):
     command = drive_module.implement_command(tmp_path, tmp_path / "plan.md", first=False)
 

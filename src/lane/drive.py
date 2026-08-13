@@ -42,6 +42,11 @@ MIN_REDACTED_SECRET = 8
 PLAN_RELPATH = ".ai-bridge/current-plan.md"
 SESSION_RELPATH = ".ai-bridge/lane-session"
 GATE_LOG_LIMIT = 4000
+# gjc -p can outlive its own answer: a tool-executing run spawns a browser
+# warmup whose teardown was measured (2026-08-13) taking minutes past the final
+# output, once past three. Unbounded, a gjc that never exits stalls the loop
+# while it holds the drive lock. Same budget as the session-send path.
+IMPLEMENT_TIMEOUT_SECONDS = 1800
 
 PLAN_REQUEST = """\
 Write an implementation plan for the task below.
@@ -111,7 +116,7 @@ def write_plan(root: Path, text: str) -> Path:
 
 
 def implement_command(root: Path, plan: Path, *, first: bool, session: str | None = None,
-                      timeout_ms: int = 1_800_000) -> list[str]:
+                      timeout_ms: int = IMPLEMENT_TIMEOUT_SECONDS * 1000) -> list[str]:
     """Command that makes gjc execute the plan.
 
     Default path is a lane-owned headless session directory: `--continue` keeps
@@ -131,7 +136,12 @@ def implement_command(root: Path, plan: Path, *, first: bool, session: str | Non
 def implement(root: Path, plan: Path, *, first: bool, session: str | None = None) -> str:
     command = implement_command(root, plan, first=first, session=session)
     try:
-        result = proc.run(command, cwd=root)
+        result = proc.run(command, cwd=root, timeout=IMPLEMENT_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired as error:
+        raise DriveError(
+            f"gjc did not finish within {IMPLEMENT_TIMEOUT_SECONDS}s and was killed; "
+            "the worktree may hold a partial implementation"
+        ) from error
     except (OSError, subprocess.SubprocessError) as error:
         raise DriveError(f"gjc could not run: {error}") from error
     if result.returncode != 0:
