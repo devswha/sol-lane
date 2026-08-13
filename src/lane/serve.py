@@ -25,6 +25,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from . import locks, proc
+from . import tools as tools_module
 from .review import browser_env
 
 ROLE_LABELS = {"system": "SYSTEM", "user": "USER", "assistant": "ASSISTANT", "tool": "TOOL"}
@@ -84,19 +85,32 @@ def text_of(content: object) -> str:
     return ""
 
 
+def offered_tools(request: dict) -> list[dict]:
+    """The tools this request actually puts on the table.
+
+    `tool_choice: "none"` means the caller wants prose, so the specs are not
+    rendered and a fenced block in the reply is just text.
+    """
+    tools = request.get("tools")
+    if not isinstance(tools, list) or not tools:
+        return []
+    if request.get("tool_choice") == "none":
+        return []
+    return [tool for tool in tools if isinstance(tool, dict)]
+
+
 def unsupported_request(request: dict) -> str | None:
     """Why this request cannot be served honestly, if it cannot.
 
-    Silently dropping tool definitions produces a model that looks like it
-    chose not to call a tool, when it never saw one.
+    Tools are bridged now (see tools.py), but a *forced* call is not: the bridge
+    asks in prose and cannot make Pro comply, so promising `required` would be a
+    lie the caller acts on.
     """
-    tools = request.get("tools")
-    if isinstance(tools, list) and tools:
-        return ("tool calling is not bridged to Sol Pro yet; "
-                "run gjc with --no-tools or use a tool-capable model")
+    choice = request.get("tool_choice")
+    if choice is not None and choice not in ("none", "auto"):
+        return (f"tool_choice {json.dumps(choice)} cannot be enforced through a prose "
+                "bridge; use \"auto\"")
     for message in request.get("messages") or []:
-        if message.get("tool_calls") or message.get("tool_call_id"):
-            return "tool results cannot be replayed to Sol Pro yet"
         content = message.get("content")
         if isinstance(content, list) and any(
             not (isinstance(part, dict) and isinstance(part.get("text"), str)) for part in content
@@ -105,15 +119,27 @@ def unsupported_request(request: dict) -> str | None:
     return None
 
 
-def render_prompt(messages: list[dict]) -> str:
-    """Render a chat transcript the engine can send as a single prompt."""
+def render_prompt(messages: list[dict], tools: list[dict] | None = None) -> str:
+    """Render a chat transcript the engine can send as a single prompt.
+
+    Tool traffic is rendered as prose because the model never sees the OpenAI
+    envelope: a call it made last turn and the result it got back have to read as
+    part of the conversation or the next turn repeats the call.
+    """
     blocks = [TRANSCRIPT_HEADER, ""]
+    if tools:
+        blocks.append(tools_module.render_tools(tools))
     for message in messages:
-        body = text_of(message.get("content")).strip()
+        role = str(message.get("role"))
+        if role == "tool":
+            body = tools_module.render_tool_result(message).strip()
+        else:
+            body = text_of(message.get("content")).strip()
+            calls = tools_module.render_assistant_calls(message)
+            body = f"{body}\n{calls}".strip() if calls else body
         if not body:
             continue
-        label = ROLE_LABELS.get(str(message.get("role")), "USER")
-        blocks.append(f"[{label}]\n{body}")
+        blocks.append(f"[{ROLE_LABELS.get(role, 'USER')}]\n{body}")
     blocks.append("[ASSISTANT]")
     return "\n\n".join(blocks)
 
@@ -138,9 +164,16 @@ def run_engine(settings: ServeSettings, prompt: str) -> str:
     return answer
 
 
-def completion_payload(model: str, answer: str, prompt: str, *, delta: bool) -> dict:
-    message = {"role": "assistant", "content": answer}
-    choice: dict = {"index": 0, "finish_reason": None if delta else "stop"}
+def completion_payload(model: str, answer: str, prompt: str, *, delta: bool,
+                       calls: tuple[tools_module.ToolCall, ...] = ()) -> dict:
+    # A tool call carries no prose of its own; content must be null, not "", or a
+    # client renders an empty assistant turn beside the call.
+    content = (answer.strip() or None) if calls else answer
+    message: dict = {"role": "assistant", "content": content}
+    if calls:
+        message["tool_calls"] = [call.as_openai() for call in calls]
+    stop_reason = "tool_calls" if calls else "stop"
+    choice: dict = {"index": 0, "finish_reason": None if delta else stop_reason}
     choice["delta" if delta else "message"] = message
     prompt_tokens = estimate_tokens(prompt)
     completion_tokens = estimate_tokens(answer)
@@ -158,6 +191,17 @@ def completion_payload(model: str, answer: str, prompt: str, *, delta: bool) -> 
     }
 
 
+def split_reply(answer: str, allowed: list[str]) -> tuple[str, list[tools_module.ToolCall]]:
+    """Separate prose from tool calls, but only when tools were on the table.
+
+    With no tools offered there is nothing to call, so a fenced block is just
+    text the caller asked for — parsing it would turn an answer into an error.
+    """
+    if not allowed:
+        return answer, []
+    return tools_module.parse_reply(answer, allowed=allowed)
+
+
 def json_frame(payload: dict) -> bytes:
     return f"data: {json.dumps(payload)}\n\n".encode()
 
@@ -173,11 +217,12 @@ def heartbeat_frame(model: str) -> bytes:
     })
 
 
-def sse_frames(model: str, answer: str, prompt: str) -> list[bytes]:
-    opening = completion_payload(model, answer, prompt, delta=True)
-    closing = completion_payload(model, answer, prompt, delta=True)
+def sse_frames(model: str, answer: str, prompt: str,
+               calls: tuple[tools_module.ToolCall, ...] = ()) -> list[bytes]:
+    opening = completion_payload(model, answer, prompt, delta=True, calls=calls)
+    closing = completion_payload(model, answer, prompt, delta=True, calls=calls)
     closing["choices"][0]["delta"] = {}
-    closing["choices"][0]["finish_reason"] = "stop"
+    closing["choices"][0]["finish_reason"] = "tool_calls" if calls else "stop"
     frames = [f"data: {json.dumps(payload)}\n\n".encode() for payload in (opening, closing)]
     frames.append(b"data: [DONE]\n\n")
     return frames
@@ -206,14 +251,17 @@ def make_handler(settings: ServeSettings, *, runner=run_engine, lock=None, log=p
             if refusal is not None:
                 log(f"!! refused: {refusal}")
                 return self._error(400, refusal)
-            prompt = render_prompt(messages)
+            tools = offered_tools(request)
+            allowed = tools_module.declared_names(tools)
+            prompt = render_prompt(messages, tools)
             model = str(request.get("model", settings.model))
 
             started = time.time()
-            log(f"-> {len(messages)} messages, {len(prompt)} chars; waiting for Sol Pro")
+            log(f"-> {len(messages)} messages, {len(tools)} tools, {len(prompt)} chars; "
+                "waiting for Sol Pro")
 
             if request.get("stream"):
-                return self._stream(model, prompt, started)
+                return self._stream(model, prompt, started, allowed)
 
             with guard:  # one browser, one conversation
                 try:
@@ -221,8 +269,14 @@ def make_handler(settings: ServeSettings, *, runner=run_engine, lock=None, log=p
                 except ServeError as error:
                     log(f"!! {error}")
                     return self._error(502, str(error))
-            log(f"<- {len(answer)} chars in {time.time() - started:.0f}s")
-            return self._json(200, completion_payload(model, answer, prompt, delta=False))
+            try:
+                content, calls = split_reply(answer, allowed)
+            except tools_module.ToolBridgeError as error:
+                log(f"!! {error}")
+                return self._error(502, str(error))
+            log(f"<- {len(answer)} chars, {len(calls)} tool call(s) in {time.time() - started:.0f}s")
+            return self._json(200, completion_payload(model, content, prompt, delta=False,
+                                                      calls=tuple(calls)))
 
         def do_GET(self):
             if not self._authorized():
@@ -247,7 +301,7 @@ def make_handler(settings: ServeSettings, *, runner=run_engine, lock=None, log=p
         def _error(self, status: int, message: str):
             self._json(status, {"error": {"message": message, "type": "lane_delivery_error"}})
 
-        def _stream(self, model: str, prompt: str, started: float):
+        def _stream(self, model: str, prompt: str, started: float, allowed: list[str]):
             """Headers first, heartbeats while Pro thinks, then the answer."""
             self.send_response(200)
             self.send_header("content-type", "text/event-stream")
@@ -293,8 +347,16 @@ def make_handler(settings: ServeSettings, *, runner=run_engine, lock=None, log=p
                 return
 
             answer = outcome["answer"]
-            log(f"<- {len(answer)} chars in {time.time() - started:.0f}s")
-            for frame in sse_frames(model, answer, prompt):
+            try:
+                content, calls = split_reply(answer, allowed)
+            except tools_module.ToolBridgeError as error:
+                log(f"!! {error}")
+                self._write(json_frame({"error": {"message": str(error),
+                                                  "type": "lane_delivery_error"}}))
+                self._write(b"data: [DONE]\n\n")
+                return
+            log(f"<- {len(answer)} chars, {len(calls)} tool call(s) in {time.time() - started:.0f}s")
+            for frame in sse_frames(model, content, prompt, tuple(calls)):
                 if not self._write(frame):
                     return
 

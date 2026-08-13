@@ -260,17 +260,6 @@ def test_a_wrong_token_is_refused_on_model_listing():
     assert caught.value.code == 401
 
 
-def test_tool_definitions_are_refused_instead_of_silently_dropped(server):
-    with pytest.raises(urllib.error.HTTPError) as caught:
-        post(f"{server}/v1/chat/completions", {
-            "messages": [{"role": "user", "content": "hi"}],
-            "tools": [{"type": "function", "function": {"name": "read"}}],
-        })
-
-    assert caught.value.code == 400
-    assert "--no-tools" in json.loads(caught.value.read())["error"]["message"]
-
-
 def test_an_empty_tools_array_still_works(server):
     response = post(f"{server}/v1/chat/completions",
                     {"messages": [{"role": "user", "content": "hi"}], "tools": []})
@@ -331,3 +320,127 @@ def test_run_engine_refuses_an_empty_answer(monkeypatch):
 
     with pytest.raises(serve_module.ServeError, match="empty answer"):
         serve_module.run_engine(SETTINGS, "prompt")
+
+
+WEATHER_TOOL = {
+    "type": "function",
+    "function": {"name": "get_weather", "description": "weather for a city",
+                 "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}},
+}
+
+
+def call_block(payload: str) -> str:
+    from lane import tools as tools_module
+    return f"```{tools_module.FENCE}\n{payload}\n```"
+
+
+def test_offered_tools_render_into_the_prompt():
+    prompt = serve_module.render_prompt([{"role": "user", "content": "weather?"}], [WEATHER_TOOL])
+
+    assert "get_weather" in prompt
+    assert "tool_call" in prompt, "the model needs the reply protocol, not just the names"
+    assert '"city"' in prompt
+
+
+def test_tool_choice_none_keeps_the_turn_in_prose():
+    request = {"tools": [WEATHER_TOOL], "tool_choice": "none"}
+
+    assert serve_module.offered_tools(request) == []
+    assert "get_weather" not in serve_module.render_prompt(
+        [{"role": "user", "content": "hi"}], serve_module.offered_tools(request))
+
+
+def test_a_forced_tool_choice_is_refused_because_prose_cannot_enforce_it(server):
+    with pytest.raises(urllib.error.HTTPError) as caught:
+        post(f"{server}/v1/chat/completions", {
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [WEATHER_TOOL],
+            "tool_choice": {"type": "function", "function": {"name": "get_weather"}},
+        })
+
+    assert caught.value.code == 400
+    assert "cannot be enforced" in json.loads(caught.value.read())["error"]["message"]
+
+
+def test_a_tool_result_is_replayed_into_the_transcript():
+    prompt = serve_module.render_prompt([
+        {"role": "user", "content": "weather?"},
+        {"role": "assistant", "content": "",
+         "tool_calls": [{"id": "call_1", "type": "function",
+                         "function": {"name": "get_weather", "arguments": '{"city": "Seoul"}'}}]},
+        {"role": "tool", "name": "get_weather", "tool_call_id": "call_1", "content": "-3C"},
+    ])
+
+    assert "called get_weather" in prompt
+    assert "Seoul" in prompt
+    assert "-3C" in prompt, "without the result the next turn just calls again"
+
+
+def _calls_a_tool(settings, prompt):
+    return call_block('{"name": "get_weather", "arguments": {"city": "Seoul"}}')
+
+
+@pytest.mark.parametrize("server", [_calls_a_tool], indirect=True)
+def test_a_parsed_call_comes_back_as_tool_calls(server):
+    response = post(f"{server}/v1/chat/completions", {
+        "messages": [{"role": "user", "content": "weather?"}], "tools": [WEATHER_TOOL]})
+    payload = json.loads(response.read())
+
+    choice = payload["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    assert choice["message"]["content"] is None, "a call carries no prose of its own"
+    call = choice["message"]["tool_calls"][0]
+    assert call["function"]["name"] == "get_weather"
+    assert json.loads(call["function"]["arguments"]) == {"city": "Seoul"}
+
+
+@pytest.mark.parametrize("server", [_calls_a_tool], indirect=True)
+def test_a_stream_carries_the_call_and_closes_on_tool_calls(server):
+    response = post(f"{server}/v1/chat/completions", {
+        "messages": [{"role": "user", "content": "weather?"}], "tools": [WEATHER_TOOL],
+        "stream": True})
+    frames = [json.loads(line.removeprefix("data: ")) for line in response.read().decode().splitlines()
+              if line.startswith("data: ") and "[DONE]" not in line]
+
+    assert frames[0]["choices"][0]["delta"]["tool_calls"][0]["function"]["name"] == "get_weather"
+    assert frames[-1]["choices"][0]["finish_reason"] == "tool_calls"
+
+
+def _calls_an_unoffered_tool(settings, prompt):
+    return call_block('{"name": "rm_rf", "arguments": {}}')
+
+
+@pytest.mark.parametrize("server", [_calls_an_unoffered_tool], indirect=True)
+def test_a_call_to_an_unoffered_tool_is_502_not_an_answer(server):
+    with pytest.raises(urllib.error.HTTPError) as caught:
+        post(f"{server}/v1/chat/completions", {
+            "messages": [{"role": "user", "content": "hi"}], "tools": [WEATHER_TOOL]})
+
+    assert caught.value.code == 502
+    assert "was not offered" in json.loads(caught.value.read())["error"]["message"]
+
+
+def _emits_a_truncated_call(settings, prompt):
+    from lane import tools as tools_module
+    return f'checking\n```{tools_module.FENCE}\n{{"name": "get_weather"'
+
+
+@pytest.mark.parametrize("server", [_emits_a_truncated_call], indirect=True)
+def test_a_truncated_call_is_502_rather_than_executed(server):
+    with pytest.raises(urllib.error.HTTPError) as caught:
+        post(f"{server}/v1/chat/completions", {
+            "messages": [{"role": "user", "content": "hi"}], "tools": [WEATHER_TOOL]})
+
+    assert caught.value.code == 502
+    assert "never closes" in json.loads(caught.value.read())["error"]["message"]
+
+
+@pytest.mark.parametrize("server", [_calls_a_tool], indirect=True)
+def test_a_fenced_block_is_plain_text_when_no_tools_were_offered(server):
+    """Nothing was on the table, so nothing can be called — and an answer that
+    happens to contain the fence must not become a delivery error."""
+    response = post(f"{server}/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}]})
+    payload = json.loads(response.read())
+
+    assert payload["choices"][0]["finish_reason"] == "stop"
+    assert "get_weather" in payload["choices"][0]["message"]["content"]
