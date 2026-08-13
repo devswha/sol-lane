@@ -226,8 +226,12 @@ lane engine sync              →  둘을 합쳐 vendor/pack_and_ask.py 생성 +
 1. ~~`lane review` 안정화~~
 2. ~~`lane serve` — Sol Pro 모드(대화)~~
 3. ~~`lane drive` — 계획·구현·게이트 루프~~
-4. ~~엔진 핀 v0.6.1 + `lane harvest`~~ ← 지금 여기. 중단된 판을 메시지 없이 회수한다.
-5. insane-review fork — `0001`은 업스트림 main에 세 헝크 전부 붙는다(offset 167).
-   PR 후보 확정.
-6. tool call 브리지 — serve가 도구 턴을 돌리려면 필수. 지금은 400으로 거절한다.
-7. 선별·구조화 강화 — 파일 집합 자동 확정, 계획 스키마 검증
+4. ~~엔진 핀 v0.6.1 + `lane harvest` + `lane salvage`~~ — 중단된 판을 메시지 없이 회수한다.
+5. ~~tool call 브리지~~ — `serve`가 `tools`를 렌더하고 답을 파싱해 `tool_calls`로 돌려준다.
+   파싱 실패는 502, 강제 선택(`required`)은 400. 산문 브리지는 강제할 수 없다.
+6. insane-review 업스트림 — PR [#4](https://github.com/fivetaku/insane-review/pull/4)(대화 URL
+   영속화 시점), [#5](https://github.com/fivetaku/insane-review/pull/5)(모델명 라벨/값 줄),
+   이슈 [#6](https://github.com/fivetaku/insane-review/issues/6)(force-answer 어포던스 소실).
+   `0002`(슬라이더)는 #5 머지 후 스택 — 단독으로는 순수 main에 둘째 헝크가 안 붙는다.
+7. 세션↔대화 매핑 — `serve`는 아직 호출마다 전체 트랜스크립트를 다시 렌더한다.
+8. 선별·구조화 강화 — 파일 집합 자동 확정, 계획 스키마 검증.
