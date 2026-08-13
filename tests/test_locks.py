@@ -51,8 +51,8 @@ def test_the_lock_is_released_when_the_holder_exits(tmp_path: Path):
     holder = start_holder(lock, flag, 0.3)
     holder.wait(10)
 
-    with locks.exclusive(lock, timeout=2) as handle:
-        assert handle.tell() >= 0
+    with locks.exclusive(lock, timeout=2) as held:
+        assert held.fileno() >= 0
 
 
 def test_waiting_is_announced_once(tmp_path: Path):
@@ -80,3 +80,63 @@ def test_browser_lock_path_is_overridable(monkeypatch, tmp_path: Path):
     monkeypatch.setenv("LANE_BROWSER_LOCK", str(tmp_path / "custom.lock"))
 
     assert locks.browser_lock_path() == tmp_path / "custom.lock"
+
+
+def test_deleting_the_lock_file_does_not_release_the_lock(tmp_path: Path):
+    """Sol Pro, reviewing this module 2026-08-13: flock locks an inode, so a lock
+    file removed or replaced while held lets the next process straight in. The
+    drive lock lives in the worktree the implementer edits, so this is reachable."""
+    lock, flag = tmp_path / "browser.lock", tmp_path / "held"
+    holder = start_holder(lock, flag, 1.5)
+    try:
+        lock.unlink()
+        with pytest.raises(locks.LockBusy, match="another process holds"):
+            with locks.exclusive(lock, timeout=0):
+                pass
+    finally:
+        holder.wait(10)
+
+
+def test_replacing_the_lock_file_does_not_release_the_lock(tmp_path: Path):
+    lock, flag = tmp_path / "browser.lock", tmp_path / "held"
+    holder = start_holder(lock, flag, 1.5)
+    try:
+        lock.unlink()
+        lock.write_text("999999\n", encoding="utf-8")
+        with pytest.raises(locks.LockBusy):
+            with locks.exclusive(lock, timeout=0):
+                pass
+    finally:
+        holder.wait(10)
+
+
+def test_the_lock_works_when_the_pid_file_cannot_be_written(tmp_path: Path):
+    """The record beside the lock is for humans; it is not the lock."""
+    directory = tmp_path / "readonly"
+    directory.mkdir()
+    lock = directory / "browser.lock"
+    directory.chmod(0o500)
+    try:
+        with locks.exclusive(lock, timeout=0):
+            assert not lock.exists(), "nothing could be written, and that is fine"
+    finally:
+        directory.chmod(0o700)
+
+
+def test_two_spellings_of_one_path_are_one_lock(tmp_path: Path):
+    direct = tmp_path / "browser.lock"
+    indirect = tmp_path / "." / "browser.lock"
+
+    assert locks.abstract_name(direct) == locks.abstract_name(indirect)
+
+
+def test_different_paths_are_different_locks(tmp_path: Path):
+    assert locks.abstract_name(tmp_path / "a.lock") != locks.abstract_name(tmp_path / "b.lock")
+
+
+def test_a_long_path_still_fits_the_abstract_namespace(tmp_path: Path):
+    deep = tmp_path / ("x" * 90) / ("y" * 90) / "drive.lock"
+
+    name = locks.abstract_name(deep)
+
+    assert len(name) <= 108 and name.startswith(b"\0lane-")

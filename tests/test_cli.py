@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins
 import json
 from pathlib import Path
 
@@ -176,3 +177,20 @@ def test_harvest_without_a_source_or_a_manifest_is_a_delivery_error(write_config
 
     assert cli.main(["--config", str(config), "harvest", "demo"]) == cli.EXIT_DELIVERY
     assert "no run manifest" in capsys.readouterr().err
+
+
+def test_a_closed_pipe_is_not_a_traceback(write_config, project_root: Path, monkeypatch, capsys):
+    """`lane projects | head -1` closes the pipe; the caller asked for that."""
+    config = write_config()
+    real_print = builtins.print
+    calls = {"n": 0}
+
+    def print_then_break(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] >= 1:
+            raise BrokenPipeError(32, "Broken pipe")
+        real_print(*args, **kwargs)
+
+    monkeypatch.setattr(builtins, "print", print_then_break)
+
+    assert cli.main(["--config", str(config), "projects"]) == cli.EXIT_OK

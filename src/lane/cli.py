@@ -9,6 +9,7 @@ Exit codes are part of the contract so the lane can be scripted:
 from __future__ import annotations
 
 import argparse
+import io
 import os
 import shutil
 import sys
@@ -80,6 +81,21 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     proc.exit_on_sigterm()
+    try:
+        return _dispatch(argv)
+    except BrokenPipeError:
+        # `lane doctor | head` closes the pipe mid-write. Python would otherwise
+        # print a traceback at shutdown for what the caller asked for. Pointing
+        # stdout at /dev/null silences that; when stdout is not a real file
+        # descriptor there is nothing to silence.
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except (OSError, ValueError, io.UnsupportedOperation):
+            pass
+        return EXIT_OK
+
+
+def _dispatch(argv: list[str] | None) -> int:
     args = build_parser().parse_args(argv)
     try:
         config = _load_config(args.config)
