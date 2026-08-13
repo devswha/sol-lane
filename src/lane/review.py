@@ -46,6 +46,8 @@ PROMPT_ECHO_CHARS = 200
 # Below this the head is not evidence of anything: a short question is quoted by
 # perfectly good answers.
 MIN_ECHO_CHARS = 120
+# What the engine's own header always carries. Anything else is content.
+HEADER_MARKERS = ("- 모델:", "- 패킹:")
 CONVERSATION_RE = re.compile(r"/c/[0-9a-f]{8}[0-9a-f-]{4,}", re.IGNORECASE)
 X11_SOCKETS = "/tmp/.X11-unix/X*"
 # Measured over five long runs: 78 KB reasoned 37m, 164 KB 31m, 290 KB 40m. Pack
@@ -202,9 +204,16 @@ def _is_answer(path: Path) -> bool:
 
 
 def answer_body(text: str) -> str:
-    """The answer under the engine's metadata header."""
-    _, separator, body = text.partition("\n---\n")
-    return (body if separator else text).strip()
+    """The answer under the engine's metadata header.
+
+    Only a real header is stripped. Splitting on the first rule regardless meant a
+    refusal followed by `---` was discarded *as* the header, leaving a footer to
+    pass verification. (Sol Pro, reviewing this file 2026-08-13.)
+    """
+    head, separator, body = text.partition("\n---\n")
+    if separator and head.startswith("#") and any(marker in head for marker in HEADER_MARKERS):
+        return body.strip()
+    return text.strip()
 
 
 def rejection_reason(body: str, prompt: str) -> str | None:
@@ -217,12 +226,20 @@ def rejection_reason(body: str, prompt: str) -> str | None:
     normalised = " ".join(body.split())
     if not normalised:
         return "the saved answer is empty"
-    for marker in REFUSAL_MARKERS:
-        if marker in body:
-            return f"the model refused: {marker}"
+    refusal = refusal_in(body)
+    if refusal is not None:
+        return refusal
     head = " ".join(prompt.split())[:PROMPT_ECHO_CHARS]
     if len(head) >= MIN_ECHO_CHARS and head in normalised:
         return "the saved text is the prompt echoed back, not an answer"
+    return None
+
+
+def refusal_in(text: str) -> str | None:
+    """The refusal marker this text carries, if any."""
+    for marker in REFUSAL_MARKERS:
+        if marker in text:
+            return f"the model refused: {marker}"
     return None
 
 
@@ -296,7 +313,10 @@ def _verified(returncode: int, response: Path | None, prompt: str) -> ReviewOutc
     """A saved file only counts once its contents are an answer to *prompt*."""
     if response is None:
         return ReviewOutcome(returncode=returncode, response=None)
-    reason = rejection_reason(answer_body(response.read_text(encoding="utf-8")), prompt)
+    text = response.read_text(encoding="utf-8")
+    # The whole file is checked for a refusal as well as the body: a marker must
+    # not become invisible by landing where a header would be.
+    reason = rejection_reason(answer_body(text), prompt) or refusal_in(text)
     if reason is None:
         return ReviewOutcome(returncode=returncode, response=response)
     return ReviewOutcome(returncode=returncode, response=None,

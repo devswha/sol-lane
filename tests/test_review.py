@@ -254,3 +254,34 @@ def test_verification_leaves_a_real_answer_alone(tmp_path: Path):
 
     assert outcome.response == path
     assert (outcome.rejected, outcome.reason) == (None, None)
+
+
+def test_only_a_real_engine_header_is_stripped():
+    """Sol Pro, reviewing this file 2026-08-13: splitting on the first rule made a
+    refusal disappear *as* the header, leaving a footer to pass verification."""
+    disguised = f"{review_module.REFUSAL_MARKERS[0]}\n---\nfooter line"
+
+    body = review_module.answer_body(disguised)
+
+    assert review_module.REFUSAL_MARKERS[0] in body
+    assert review_module.rejection_reason(body, "prompt") is not None
+
+
+def test_a_real_header_is_still_stripped():
+    assert review_module.answer_body(saved(ANSWER)) == ANSWER
+
+
+def test_a_header_shaped_text_without_the_engine_markers_is_content():
+    text = "# 제목\n\n본문 첫 줄\n---\n본문 둘째 줄"
+
+    assert review_module.answer_body(text) == text.strip()
+
+
+def test_a_refusal_hidden_where_a_header_would_be_is_still_caught(tmp_path: Path):
+    path = tmp_path / "response_run.md"
+    path.write_text(f"{review_module.REFUSAL_MARKERS[0]}\n---\nfooter", encoding="utf-8")
+
+    outcome = review_module._verified(0, path, "prompt")
+
+    assert outcome.response is None
+    assert "refused" in outcome.reason
