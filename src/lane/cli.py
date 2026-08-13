@@ -331,6 +331,10 @@ def _review(config: Config, args: argparse.Namespace) -> int:
     outcome = review_module.run(engine_path, project, root, args.prompt, include=include)
     if outcome.returncode != 0 or outcome.response is None:
         print("lane: review did not produce a verified response (fail-closed)", file=sys.stderr)
+        if outcome.reason:
+            print(f"reason     {outcome.reason}", file=sys.stderr)
+        if outcome.rejected:
+            print(f"rejected   {outcome.rejected}", file=sys.stderr)
         _print_harvest_hint(root, project.name)
         return EXIT_DELIVERY
     print(f"response   {outcome.response}")

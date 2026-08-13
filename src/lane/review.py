@@ -28,6 +28,24 @@ MANIFEST_GLOB = ".insane-review/manifest_*.json"
 # Long enough to load the conversation and read a finished answer, short enough
 # that probing a dead one is not a vigil.
 HARVEST_WAIT_SECONDS = 300
+
+# A refusal is a delivered page, not a delivered answer. Measured 2026-08-13: a
+# question phrased as "find the most feasible way to break this guarantee" came
+# back as 이 콘텐츠는 표시할 수 없습니다 / Trusted Access, and the lane filed it as a
+# verified response with exit 0.
+REFUSAL_MARKERS = (
+    "이 콘텐츠는 표시할 수 없습니다",
+    "Trusted Access",
+    "사이버보안 관련 요청은",
+    "I can't help with that",
+    "I'm unable to help with that",
+)
+# How much of the prompt's head, whitespace-normalised, may not reappear as the
+# answer. The same run also saved the user turn as the assistant's reply.
+PROMPT_ECHO_CHARS = 200
+# Below this the head is not evidence of anything: a short question is quoted by
+# perfectly good answers.
+MIN_ECHO_CHARS = 120
 CONVERSATION_RE = re.compile(r"/c/[0-9a-f]{8}[0-9a-f-]{4,}", re.IGNORECASE)
 X11_SOCKETS = "/tmp/.X11-unix/X*"
 # Measured over five long runs: 78 KB reasoned 37m, 164 KB 31m, 290 KB 40m. Pack
@@ -41,6 +59,8 @@ PACK_WARN_BYTES = 200_000
 class ReviewOutcome:
     returncode: int
     response: Path | None
+    rejected: Path | None = None
+    reason: str | None = None
 
 
 def engine_args(project: Project, prompt: str, *, include: tuple[str, ...] | None = None,
@@ -181,6 +201,42 @@ def _is_answer(path: Path) -> bool:
         return False
 
 
+def answer_body(text: str) -> str:
+    """The answer under the engine's metadata header."""
+    _, separator, body = text.partition("\n---\n")
+    return (body if separator else text).strip()
+
+
+def rejection_reason(body: str, prompt: str) -> str | None:
+    """Why this text is not an answer, if it is not.
+
+    The lane's promise is that a saved response was verified. A refusal page and
+    an echo of the question both arrive as a non-empty file with exit 0, so the
+    file existing is not the evidence — this is.
+    """
+    normalised = " ".join(body.split())
+    if not normalised:
+        return "the saved answer is empty"
+    for marker in REFUSAL_MARKERS:
+        if marker in body:
+            return f"the model refused: {marker}"
+    head = " ".join(prompt.split())[:PROMPT_ECHO_CHARS]
+    if len(head) >= MIN_ECHO_CHARS and head in normalised:
+        return "the saved text is the prompt echoed back, not an answer"
+    return None
+
+
+def reject(path: Path, reason: str) -> Path:
+    """Move a non-answer out of the response namespace and say why."""
+    target = path.with_name(path.name.replace("response_", "rejected_", 1))
+    if target == path:
+        target = path.with_name(f"rejected_{path.name}")
+    text = path.read_text(encoding="utf-8")
+    target.write_text(f"# REJECTED — {reason}\n\n{text}", encoding="utf-8")
+    path.unlink()
+    return target
+
+
 def ask(engine: Path, project: Project, root: Path, prompt: str, *,
         include: tuple[str, ...] | None = None, python: str | None = None) -> str:
     """Pack the project, ask Sol Pro, and return the answer as text."""
@@ -200,6 +256,9 @@ def ask(engine: Path, project: Project, root: Path, prompt: str, *,
     answer = result.stdout.strip()
     if not answer:
         raise ReviewError("engine returned an empty answer (fail-closed)")
+    reason = rejection_reason(answer, prompt)
+    if reason is not None:
+        raise ReviewError(f"engine delivered a page but not an answer — {reason}")
     return answer
 
 
@@ -215,7 +274,9 @@ def harvest(engine: Path, project: Project, root: Path, source: str, *,
         result = proc.run(harvest_command(engine, project, source, max_wait=max_wait, python=python),
                           cwd=root, env=browser_env(), capture=False)
         response = newest_new_response(root, before)
-    return ReviewOutcome(returncode=result.returncode, response=response)
+    # A harvest has no prompt to compare against — the conversation is whatever it
+    # is — but a refusal page is still not an answer.
+    return _verified(result.returncode, response, "")
 
 
 def run(engine: Path, project: Project, root: Path, prompt: str, *,
@@ -228,4 +289,15 @@ def run(engine: Path, project: Project, root: Path, prompt: str, *,
         result = proc.run(command(engine, project, prompt, include=include, python=python),
                           cwd=root, env=browser_env(), capture=False)
         response = newest_new_response(root, before)
-    return ReviewOutcome(returncode=result.returncode, response=response)
+    return _verified(result.returncode, response, prompt)
+
+
+def _verified(returncode: int, response: Path | None, prompt: str) -> ReviewOutcome:
+    """A saved file only counts once its contents are an answer to *prompt*."""
+    if response is None:
+        return ReviewOutcome(returncode=returncode, response=None)
+    reason = rejection_reason(answer_body(response.read_text(encoding="utf-8")), prompt)
+    if reason is None:
+        return ReviewOutcome(returncode=returncode, response=response)
+    return ReviewOutcome(returncode=returncode, response=None,
+                         rejected=reject(response, reason), reason=reason)

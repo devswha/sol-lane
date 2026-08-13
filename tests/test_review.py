@@ -168,3 +168,89 @@ def test_a_manifest_without_a_conversation_is_refused(tmp_path: Path):
 
     assert review_module.conversation_of(path) is None
     assert review_module.conversation_of(broken) is None
+
+
+HEADER = "# sol-lane — GPT 응답\n\n- 모델: `GPT-5.6 Sol (Pro)`\n- 프롬프트: 게이트 동결에 구멍이 있나...\n"
+ANSWER = "(a) src/lane/drive.py:120 (b) baseline은 루프 전에만 계산된다 (c) 재현 ... (d) 수정 ..."
+
+
+def saved(body: str) -> str:
+    return f"{HEADER}\n---\n\n{body}\n"
+
+
+def test_answer_body_strips_the_engine_header():
+    assert review_module.answer_body(saved(ANSWER)) == ANSWER
+
+
+def test_answer_body_passes_through_a_file_without_a_header():
+    assert review_module.answer_body("bare answer\n") == "bare answer"
+
+
+def test_a_real_answer_is_not_rejected():
+    assert review_module.rejection_reason(ANSWER, "게이트 동결에 구멍이 있나") is None
+
+
+def test_an_empty_answer_is_rejected():
+    assert "empty" in review_module.rejection_reason("   \n ", "prompt")
+
+
+def test_a_refusal_page_is_not_an_answer():
+    """Measured 2026-08-13: an audit phrased as 'find the way to break this'
+    came back as a refusal page, and the lane filed it with exit 0."""
+    body = f"{review_module.REFUSAL_MARKERS[0]}\n어쩌구"
+
+    reason = review_module.rejection_reason(body, "prompt")
+
+    assert reason is not None and "refused" in reason
+
+
+def test_the_prompt_echoed_back_is_not_an_answer():
+    """Same run: the text saved as the answer was the user turn."""
+    prompt = ("첨부 파일 두 개만 본다. 짧게 답해라 — 5분 안에 끝낼 분량으로. 한 가지만 묻는다. "
+              "보장: 구현자는 게이트 자체를 약화시켜 drive를 통과할 수 없다. "
+              "구현: drive()가 루프 시작 전에 검증 파일 해시를 얼리고 대조한다. "
+              "형식: (a) 파일:라인 (b) 문제 코드 (c) 재현 (d) 최소 수정안.")
+
+    reason = review_module.rejection_reason(prompt, prompt)
+
+    assert reason is not None and "prompt" in reason
+
+
+def test_a_short_shared_phrase_does_not_look_like_an_echo():
+    prompt = "게이트 동결에 구멍이 있나"
+
+    assert review_module.rejection_reason(f"{prompt} — 있다. drive.py:120 ...", prompt) is None
+
+
+def test_reject_moves_the_file_out_of_the_response_namespace(tmp_path: Path):
+    path = tmp_path / "response_sol-lane_20260813_182740.md"
+    path.write_text(saved("nope"), encoding="utf-8")
+
+    moved = review_module.reject(path, "the model refused")
+
+    assert not path.exists(), "a rejected page must not stay where responses live"
+    assert moved.name == "rejected_sol-lane_20260813_182740.md"
+    text = moved.read_text(encoding="utf-8")
+    assert text.startswith("# REJECTED — the model refused")
+    assert "nope" in text, "the evidence is kept, only its status changes"
+
+
+def test_verification_turns_a_refusal_into_a_delivery_failure(tmp_path: Path):
+    path = tmp_path / "response_run.md"
+    path.write_text(saved(review_module.REFUSAL_MARKERS[0]), encoding="utf-8")
+
+    outcome = review_module._verified(0, path, "prompt")
+
+    assert outcome.response is None, "exit 0 with a saved file is exactly the false success"
+    assert outcome.rejected is not None and outcome.rejected.exists()
+    assert "refused" in outcome.reason
+
+
+def test_verification_leaves_a_real_answer_alone(tmp_path: Path):
+    path = tmp_path / "response_run.md"
+    path.write_text(saved(ANSWER), encoding="utf-8")
+
+    outcome = review_module._verified(0, path, "게이트 동결에 구멍이 있나")
+
+    assert outcome.response == path
+    assert (outcome.rejected, outcome.reason) == (None, None)
