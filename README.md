@@ -220,6 +220,33 @@ profiles:
 - 루프백 밖에 바인드하려면 `SOL_PRO_LOCAL_KEY`가 필수다 — 포트에 닿는 누구나
   구독 메시지를 쓸 수 있기 때문이다.
 
+### 다른 PC에서 붙기
+
+serve와 브라우저는 한 머신(A)에 두고, gjc만 다른 PC(B)에서 쓰는 구성이 된다.
+B에는 gjc와 `models.yml` 등록만 있으면 되고, 레포·엔진·로그인은 전부 A에 남는다.
+
+**권장: SSH 터널.** serve는 루프백 그대로, 설정 변경 없음.
+
+```bash
+# B에서
+ssh -N -L 8799:127.0.0.1:8799 user@machine-A &
+SOL_PRO_LOCAL_KEY=local gjc --mpreset sol-pro   # models.yml은 위 블록 그대로
+```
+
+**직결(LAN 바인드).** 토큰 없이는 거부된다(exit 2) — 포트에 닿는 누구나 구독
+메시지를 쓰기 때문이다. 트래픽이 평문 HTTP로 다니므로 신뢰하는 망에서만.
+
+```bash
+# A에서
+SOL_PRO_LOCAL_KEY=<긴-랜덤-토큰> uv run lane serve --host 0.0.0.0
+# B의 models.yml: baseUrl을 http://<A의-IP>:8799/v1 로
+# B에서: SOL_PRO_LOCAL_KEY=<같은-토큰> gjc --mpreset sol-pro
+```
+
+어느 쪽이든 직렬화는 serve가 한다 — 여러 PC가 동시에 물어도 브라우저 하나에
+한 번에 한 판씩 태우고, 뒤에 선 요청은 하트비트로 대기한다. 단, 메시지 예산도
+그만큼 같이 쓴다.
+
 계약 전체(스트리밍·타임아웃·gjc 쪽 실측)는 [docs/sol-pro-mode.md](docs/sol-pro-mode.md).
 
 ## 엔진은 핀 + 패치로 관리한다
