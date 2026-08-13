@@ -94,6 +94,21 @@ OpenAI completions stream timed out while waiting for the first event
 `vendor/patches/0002-effort-slider-2026-08.patch`가 슬라이더를 최소칸으로 정규화한 뒤
 오른쪽으로 밀면서 composer pill을 판정 근거로 읽는다.
 
+### 5. 도구를 실행한 `gjc -p`는 답을 낸 뒤 스스로 끝나지 않는다 (2026-08-13 실측)
+
+tool call을 한 번이라도 **실행한** 판은 최종 답을 출력한 뒤에도 프로세스가 남는다.
+gjc(0.13.1)가 도구 첫 실행 시 띄우는 headless Chromium warmup
+(`/tmp/gjc-profile-warmup-*`, `--remote-debugging-port=0`)이 이벤트 루프를 잡는다.
+
+- 관측 3판 전부 외부 kill로만 끝났다: `timeout` 124 두 번(150s·180s 초과), SIGTERM
+  143 한 번. 자체 종료는 0회.
+- 종료 후에도 warmup Chromium 프로세스들이 고아로 남는다.
+- 도구가 제공만 되고 실행되지 않은 판, `--no-tools` 판은 즉시 종료한다.
+
+스크립트에서 `gjc -p`를 부르면 반드시 상한을 걸어라. `lane drive`의 구현 단계는
+`IMPLEMENT_TIMEOUT_SECONDS`(30분)로 묶여 있고, 초과 시 프로세스 그룹째 죽인다 —
+warmup Chromium도 같은 세션이라 함께 정리된다.
+
 ## 최종 구조
 
 ```
