@@ -45,7 +45,16 @@
      sent_unknown = False
      quota_hit = False
      manifest_path = out_dir / f"manifest_{label}_{run_tag}.json"
-@@ -1945,9 +1966,35 @@
+@@ -1940,14 +1961,43 @@
+                     if conv_url:
+                         # ── 회수 경로(재전송 없음): 결속된 대화 URL로 가서 이어서/다시 대기 ──
+                         # 타임아웃·예외 후 재시도와 --harvest가 모두 이 경로 — 중복 채팅 생성 원천 차단.
+-                        print(f"  🔁 회수 모드(재전송 없음): {conv_url}")
++                        if continue_url and not continue_sent:
++                            print(f"  ➕ 이어 보내기: {conv_url}")
++                        else:
++                            print(f"  🔁 회수 모드(재전송 없음): {conv_url}")
+                         page.goto(conv_url, wait_until="load", timeout=60000)
                          time.sleep(2)
                          if login_state(page) == "no":
                              raise RuntimeError("ChatGPT 로그인 벽 감지 — 해당 브라우저에서 chatgpt.com 로그인 확인")
@@ -72,7 +81,7 @@
 +                                    raise RuntimeError("프롬프트가 입력창에 온전히 안 들어감 → 중단(fail-closed)")
 +                            click_send(page)
 +                            continue_sent = sent_now = True
-+                            print(f"  ➕ 이어 보냄(새 채팅 없음): {conv_url}")
++                            print("  ✓ 이어 보냄 — 새 채팅을 만들지 않았다")
                          status, text, conv_url = wait_for_turn_response(
                              page, force_after=args.force_answer_after, max_wait=mw_eff,
 -                            conv_url=conv_url, base_ids=base_ids_snapshot, skip_sent_check=True)
