@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import socket
 import threading
-from contextlib import contextmanager
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+from contextlib import contextmanager
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
@@ -448,3 +450,59 @@ def test_a_fenced_block_is_plain_text_when_no_tools_were_offered(server):
 
     assert payload["choices"][0]["finish_reason"] == "stop"
     assert "get_weather" in payload["choices"][0]["message"]["content"]
+
+
+def test_a_queued_plain_request_whose_client_left_never_spends_a_message():
+    """Sol Pro, reviewing this file 2026-08-13: the hang-up check lived only on the
+    stream path, so a queued non-streaming request ran the engine for nobody."""
+    settings = dataclasses.replace(SETTINGS, heartbeat_seconds=0.05)
+    started = threading.Semaphore(0)
+    release = threading.Event()
+    calls: list[str] = []
+
+    def runner(settings, prompt):
+        calls.append(prompt)
+        started.release()
+        release.wait(10)
+        return "first answer"
+
+    with running(runner, settings) as url:
+        holder = threading.Thread(target=lambda: post(
+            f"{url}/v1/chat/completions",
+            {"messages": [{"role": "user", "content": "first"}]}).read(), daemon=True)
+        holder.start()
+        assert started.acquire(timeout=10), "the first request never reached the engine"
+
+        # A plain request cannot be given a heartbeat, so it is queued and then
+        # abandoned at the socket level.
+        raw = socket.create_connection((urllib.parse.urlparse(url).hostname,
+                                        urllib.parse.urlparse(url).port), timeout=5)
+        body = json.dumps({"messages": [{"role": "user", "content": "second"}]}).encode()
+        raw.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: local\r\n"
+                    b"content-type: application/json\r\ncontent-length: "
+                    + str(len(body)).encode() + b"\r\n\r\n" + body)
+        time.sleep(0.3)         # the handler is now waiting for the browser
+        raw.close()             # ...and the client leaves
+        time.sleep(0.4)
+
+        release.set()
+        holder.join(10)
+
+    assert calls == [calls[0]], f"the abandoned request still ran the engine: {len(calls)} calls"
+
+
+def test_a_live_client_is_not_mistaken_for_a_departed_one():
+    """The peek must not read a keep-alive socket as closed."""
+    calls: list[str] = []
+
+    def runner(settings, prompt):
+        calls.append(prompt)
+        return "answer"
+
+    with running(runner) as url:
+        first = post(f"{url}/v1/chat/completions", {"messages": [{"role": "user", "content": "a"}]})
+        assert json.loads(first.read())["choices"][0]["message"]["content"] == "answer"
+        second = post(f"{url}/v1/chat/completions", {"messages": [{"role": "user", "content": "b"}]})
+        assert json.loads(second.read())["choices"][0]["message"]["content"] == "answer"
+
+    assert len(calls) == 2

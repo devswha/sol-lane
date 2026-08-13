@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import hmac
 import json
+import select
+import socket
 import subprocess
 import sys
 import threading
@@ -263,12 +265,20 @@ def make_handler(settings: ServeSettings, *, runner=run_engine, lock=None, log=p
             if request.get("stream"):
                 return self._stream(model, prompt, started, allowed)
 
-            with guard:  # one browser, one conversation
-                try:
-                    answer = runner(settings, prompt)
-                except ServeError as error:
-                    log(f"!! {error}")
-                    return self._error(502, str(error))
+            # Queueing is not free: the first request holds the browser for
+            # minutes, and a client that leaves in the meantime must not have a
+            # Pro message spent on its behalf. The stream path has always checked
+            # this; this one used to block on the lock and never look.
+            if not self._acquire(model, heartbeat=False):
+                log("!! client hung up while queued; engine never started")
+                return
+            try:
+                answer = runner(settings, prompt)
+            except ServeError as error:
+                log(f"!! {error}")
+                return self._error(502, str(error))
+            finally:
+                guard.release()
             try:
                 content, calls = split_reply(answer, allowed)
             except tools_module.ToolBridgeError as error:
@@ -360,12 +370,33 @@ def make_handler(settings: ServeSettings, *, runner=run_engine, lock=None, log=p
                 if not self._write(frame):
                     return
 
-        def _acquire(self, model: str) -> bool:
-            """Hold the stream open with heartbeats until the browser is free."""
+        def _acquire(self, model: str, *, heartbeat: bool = True) -> bool:
+            """Wait for the browser, giving up if the client leaves.
+
+            A stream is kept alive with heartbeats while it waits, which is also
+            how its hang-up is noticed. A plain request cannot be written to yet,
+            so the socket itself is asked instead.
+            """
             while not guard.acquire(timeout=settings.heartbeat_seconds):
-                if not self._write(heartbeat_frame(model)):
+                if heartbeat:
+                    if not self._write(heartbeat_frame(model)):
+                        return False
+                elif self._client_gone():
                     return False
+            if not heartbeat and self._client_gone():
+                guard.release()
+                return False
             return True
+
+        def _client_gone(self) -> bool:
+            """True once the peer has closed: readable, and a peek returns nothing."""
+            try:
+                readable, _, _ = select.select([self.connection], [], [], 0)
+                if not readable:
+                    return False
+                return self.connection.recv(1, socket.MSG_PEEK) == b""
+            except OSError:
+                return True
 
         def _write(self, payload: bytes) -> bool:
             """Write to the client, reporting a hang-up instead of raising."""
