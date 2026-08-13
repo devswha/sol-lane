@@ -35,7 +35,24 @@ uv run lane engine sync      # 핀된 업스트림 엔진 다운로드 + vendor/
 uv run lane doctor           # engine·browser·root 전부 ok면 준비 끝
 ```
 
-`lane doctor`가 곧 셀프테스트다. 줄마다 무엇이 빠졌는지 말해준다:
+### 첫 로그인 (새 머신에서 한 번만)
+
+엔진은 주 브라우저가 아니라 **전용 프로필**(`~/.insane-review/browser-profile`)을
+쓴다 — Chrome 136+는 기본 프로필에서 디버그 포트를 정책적으로 막기 때문이다.
+새 머신에서는 그 프로필로 한 번 로그인해둬야 한다:
+
+```bash
+chromium --remote-debugging-port=9222 \
+  --user-data-dir=$HOME/.insane-review/browser-profile \
+  --no-first-run --no-default-browser-check
+# 열린 창에서 chatgpt.com 으로 가서 Pro 계정으로 로그인
+```
+
+쿠키는 프로필 디렉토리에 보존되므로 이후는 `lane review`/`lane serve`가 알아서
+띄우고 붙는다(`--ensure-env`). 로그인 상태는 `uv run lane doctor`의 `browser` 줄로
+확인한다.
+
+`lane doctor`가 곰 셀프테스트다. 줄마다 무엇이 빠졌는지 말해준다:
 
 ```
 engine     ok       .../vendor/pack_and_ask.py
