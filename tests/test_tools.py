@@ -158,3 +158,27 @@ def test_an_assistant_turn_with_calls_renders_for_the_transcript():
 
     assert "called get_weather" in rendered
     assert "Seoul" in rendered
+
+
+def test_a_truncated_call_after_a_good_one_is_refused_not_dropped():
+    """Found while auditing this module 2026-08-13: the opening-fence check only
+    ran when no block matched, so a stream cut mid-second-call returned the first
+    call and leaked the second into content as prose."""
+    reply = (block('{"name": "get_weather", "arguments": {"city": "Seoul"}}')
+             + "\n\n다음으로 셸을 봅니다.\n\n"
+             + f'```{tools_module.FENCE}\n{{"name": "run_shell", "arguments": {{"cmd": "rm')
+
+    with pytest.raises(tools_module.ToolBridgeError, match="never closes"):
+        tools_module.parse_reply(reply, allowed=ALLOWED)
+
+
+def test_content_never_carries_a_leftover_fence():
+    reply = ("먼저 날씨입니다.\n"
+             + block('{"name": "get_weather", "arguments": {"city": "Seoul"}}')
+             + "\n그다음 답하겠습니다.")
+
+    content, calls = tools_module.parse_reply(reply, allowed=ALLOWED)
+
+    assert tools_module.FENCE not in content
+    assert "```" not in content
+    assert len(calls) == 1

@@ -104,19 +104,23 @@ def parse_reply(text: str, *, allowed: list[str]) -> tuple[str, list[ToolCall]]:
     that chose not to.
     """
     blocks = list(BLOCK_RE.finditer(text))
+    remainder = BLOCK_RE.sub("", text)
+    # Checked on what is left after the complete blocks, not on the whole reply:
+    # one good call followed by a truncated one used to return the first and let
+    # the second through as prose. A dropped call reads as a model that chose not
+    # to act, which is the failure this module exists to refuse.
+    if OPENING_RE.search(remainder):
+        raise ToolBridgeError(
+            "reply opens a tool_call block that never closes; refusing to "
+            "guess at a truncated call"
+        )
     if not blocks:
-        if OPENING_RE.search(text):
-            raise ToolBridgeError(
-                "reply opens a tool_call block that never closes; refusing to "
-                "guess at a truncated call"
-            )
         return text.strip(), []
 
     calls = []
     for index, block in enumerate(blocks):
         calls.append(_parse_block(block.group(1), index=index, allowed=allowed))
-    content = BLOCK_RE.sub("", text).strip()
-    return content, calls
+    return remainder.strip(), calls
 
 
 def _parse_block(payload: str, *, index: int, allowed: list[str]) -> ToolCall:
