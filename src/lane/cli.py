@@ -57,6 +57,15 @@ def build_parser() -> argparse.ArgumentParser:
                          help="seconds to wait for the answer (raise it when Pro is still thinking)")
     harvest.add_argument("--dry-run", action="store_true", help="print the command instead of running it")
 
+    followup = sub.add_parser(
+        "followup", help="ask again inside a conversation that already has the context")
+    followup.add_argument("project")
+    followup.add_argument("prompt")
+    followup.add_argument("source", nargs="?",
+                          help="conversation URL or manifest path (default: this project's newest run)")
+    followup.add_argument("--max-wait", type=int, help="override the configured max_wait")
+    followup.add_argument("--dry-run", action="store_true", help="print the command instead of running it")
+
     salvage = sub.add_parser(
         "salvage", help="take whatever an interrupted conversation still shows (unverified)")
     salvage.add_argument("project")
@@ -113,6 +122,8 @@ def _dispatch(argv: list[str] | None) -> int:
             return _harvest(config, args)
         if args.command == "salvage":
             return _salvage(config, args)
+        if args.command == "followup":
+            return _followup(config, args)
         return _review(config, args)
     except (ConfigError, engine_module.EngineError) as error:
         print(f"lane: {error}", file=sys.stderr)
@@ -284,6 +295,28 @@ def _conversation_source(project, root: Path, explicit: str | None) -> str:
         raise review_module.ReviewError(
             f"no run manifest under {root / '.insane-review'} for {project.name}")
     return str(manifest)
+
+
+def _followup(config: Config, args: argparse.Namespace) -> int:
+    project = config.project(args.project)
+    root = checked_root(project)
+    engine_path = _engine(config)
+    source = _conversation_source(project, root, args.source)
+
+    if args.dry_run:
+        print(" ".join(review_module.followup_command(engine_path, project, source, args.prompt,
+                                                     max_wait=args.max_wait)))
+        return EXIT_OK
+
+    outcome = review_module.followup(engine_path, project, root, source, args.prompt,
+                                     max_wait=args.max_wait)
+    if outcome.returncode != 0 or outcome.response is None:
+        print("lane: the follow-up did not produce a verified response (fail-closed)", file=sys.stderr)
+        if outcome.reason:
+            print(f"reason     {outcome.reason}", file=sys.stderr)
+        return EXIT_DELIVERY
+    print(f"response   {outcome.response}")
+    return EXIT_OK
 
 
 def _salvage(config: Config, args: argparse.Namespace) -> int:

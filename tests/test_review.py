@@ -285,3 +285,28 @@ def test_a_refusal_hidden_where_a_header_would_be_is_still_caught(tmp_path: Path
 
     assert outcome.response is None
     assert "refused" in outcome.reason
+
+
+def test_followup_sends_into_the_conversation_without_packing(write_config, tmp_path: Path):
+    command = review_module.followup_command(tmp_path / "engine.py", demo(write_config),
+                                            "https://chatgpt.com/c/abcd1234-1111-2222-3333-444444444444",
+                                            "한 줄만 더")
+
+    assert command[command.index("--continue-chat") + 1].endswith("444444444444")
+    assert command[command.index("--prompt") + 1] == "한 줄만 더"
+    for absent in ("--include", "--target", "--council", "--harvest", "--delete-pack"):
+        assert absent not in command, f"{absent} would repack, resend, or open a new chat"
+
+
+def test_followup_passes_the_model_pair_the_engine_demands(write_config, tmp_path: Path):
+    command = review_module.followup_command(tmp_path / "engine.py", demo(write_config), "u", "p")
+
+    assert command[command.index("--model") + 1] == "pro"
+    assert command[command.index("--require-model") + 1] == "GPT-5.6"
+
+
+def test_followup_can_override_the_wait(write_config, tmp_path: Path):
+    command = review_module.followup_command(tmp_path / "engine.py", demo(write_config), "u", "p",
+                                            max_wait=90)
+
+    assert command[command.index("--max-wait") + 1] == "90"

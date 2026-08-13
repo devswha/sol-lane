@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import pytest
@@ -103,6 +104,7 @@ def test_the_file_says_it_is_not_a_harvest(tmp_path: Path):
 
     text = result.path.read_text(encoding="utf-8")
     assert result.path.name.startswith("salvaged_"), "a salvage is never a response_*.md"
+    assert not result.path.is_symlink()
     assert "UNVERIFIED SALVAGE" in text
     assert "did not certify" in text
     assert URL in text
@@ -161,3 +163,32 @@ def test_salvage_refuses_a_url_that_is_not_a_conversation(tmp_path: Path):
 def test_salvage_over_handed_pages_still_requires_the_page(tmp_path: Path):
     with pytest.raises(salvage_module.SalvageError, match="not open in the browser"):
         salvage_module.salvage(URL, tmp_path, pages=[])
+
+
+def test_a_salvage_never_writes_through_a_symlink(tmp_path: Path):
+    """Sol Pro, reviewing this file 2026-08-13: the name was predictable to the
+    second and write_text follows links, so a link left at the next name would put
+    unverified text inside a verified response."""
+    victim = tmp_path / "response_real.md"
+    victim.write_text("the verified answer", encoding="utf-8")
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    (tmp_path / f"salvaged_{stamp}.md").symlink_to(victim)
+    reading = salvage_module.Reading(body="unverified text", assistant_turns=0, streaming=False)
+
+    result = salvage_module.write(URL, reading, tmp_path)
+
+    assert victim.read_text(encoding="utf-8") == "the verified answer"
+    assert not result.path.is_symlink()
+    assert "unverified text" in result.path.read_text(encoding="utf-8")
+
+
+def test_two_salvages_in_the_same_second_are_two_files(tmp_path: Path):
+    reading = salvage_module.Reading(body="first", assistant_turns=0, streaming=False)
+    other = salvage_module.Reading(body="second", assistant_turns=0, streaming=False)
+
+    first = salvage_module.write(URL, reading, tmp_path)
+    second = salvage_module.write(URL, other, tmp_path)
+
+    assert first.path != second.path
+    assert "first" in first.path.read_text(encoding="utf-8")
+    assert "second" in second.path.read_text(encoding="utf-8")

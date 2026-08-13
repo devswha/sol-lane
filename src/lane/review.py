@@ -122,6 +122,35 @@ def harvest_command(engine: Path, project: Project, source: str, *,
             "--max-wait", str(max_wait)]
 
 
+def followup_command(engine: Path, project: Project, source: str, prompt: str, *,
+                     max_wait: int | None = None, python: str | None = None) -> list[str]:
+    """Ask a follow-up inside a conversation that already carries the context.
+
+    Nothing is packed and no new chat is opened: the engine types into the bound
+    conversation. The model is not re-verified here — selection happens when a
+    chat is created, and this path deliberately never creates one — but the pair
+    is still passed because the engine refuses --require-model without --model.
+    """
+    return [python or sys.executable, str(engine),
+            "--continue-chat", source,
+            "--model", project.model,
+            "--require-model", project.require_model,
+            "--max-wait", str(max_wait or project.max_wait),
+            "--prompt", prompt]
+
+
+def followup(engine: Path, project: Project, root: Path, source: str, prompt: str, *,
+             max_wait: int | None = None, python: str | None = None) -> ReviewOutcome:
+    """Send *prompt* into an existing conversation and verify what comes back."""
+    with locks.exclusive(locks.browser_lock_path()):
+        before = responses(root)
+        result = proc.run(followup_command(engine, project, source, prompt,
+                                          max_wait=max_wait, python=python),
+                          cwd=root, env=browser_env(), capture=False)
+        response = newest_new_response(root, before)
+    return _verified(result.returncode, response, prompt)
+
+
 def newest_manifest(root: Path) -> Path | None:
     manifests = [path for path in root.glob(MANIFEST_GLOB) if path.is_file()]
     return max(manifests, key=lambda path: path.stat().st_mtime, default=None)

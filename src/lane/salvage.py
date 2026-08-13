@@ -16,6 +16,8 @@ written here.
 
 from __future__ import annotations
 
+import os
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -120,11 +122,26 @@ def render(url: str, reading: Reading) -> str:
 
 
 def write(url: str, reading: Reading, out_dir: Path) -> Salvaged:
+    """Write the salvage to a file this call creates.
+
+    Created with O_CREAT|O_EXCL through mkstemp, so an existing path is never
+    followed or truncated. A second-resolution name was both predictable and
+    collidable, and `.insane-review/` is writable by the implementation a drive is
+    running: a symlink left at the next name would have put unverified text inside
+    a verified response. (Sol Pro, reviewing this file 2026-08-13.)
+    """
     if not reading.body.strip():
         raise SalvageError(f"conversation {conversation_id(url)} holds no readable text")
     out_dir.mkdir(parents=True, exist_ok=True)
-    path = out_dir / f"salvaged_{time.strftime('%Y%m%d_%H%M%S')}.md"
-    path.write_text(render(url, reading), encoding="utf-8")
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    descriptor, name = tempfile.mkstemp(dir=out_dir, prefix=f"salvaged_{stamp}_", suffix=".md")
+    path = Path(name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(render(url, reading))
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
     return Salvaged(path=path, chars=len(reading.body.strip()),
                     assistant_turns=reading.assistant_turns, streaming=reading.streaming)
 

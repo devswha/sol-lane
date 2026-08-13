@@ -222,3 +222,19 @@ def test_review_warns_before_running_an_overridden_engine(write_config, lane_rep
     captured = capsys.readouterr()
     assert "unverified" in captured.err
     assert str(override) in captured.out, "and it really did use the override"
+
+
+def test_followup_dry_run_targets_the_newest_conversation(write_config, lane_repo: Path,
+                                                          project_root: Path, capsys):
+    config = write_config()
+    vendored_engine(lane_repo)
+    manifests = project_root / ".insane-review"
+    manifests.mkdir(exist_ok=True)
+    (manifests / "manifest_review_9.json").write_text(
+        '{"chat_url": "https://chatgpt.com/c/6a7dac02-c75c-83ea-b372-5fe8b837addf"}', encoding="utf-8")
+
+    assert cli.main(["--config", str(config), "followup", "demo", "한 줄만", "--dry-run"]) == cli.EXIT_OK
+    out = capsys.readouterr().out
+    assert "--continue-chat" in out
+    assert "manifest_review_9.json" in out
+    assert "--include" not in out, "a follow-up must not repack the project"
