@@ -23,6 +23,13 @@ from pathlib import Path
 from .review import CONVERSATION_RE
 
 CDP_ENDPOINT = "http://127.0.0.1:9222"
+# The engine closes its page in a finally block, so by the time anyone wants a
+# salvage the conversation is almost never still open. Opening it is the tool.
+OPEN_TIMEOUT_MS = 60000
+SETTLE_SECONDS = 2.0
+TURN_POLL_SECONDS = 1.0
+TURN_POLL_TRIES = 30
+ANY_TURN = "[data-message-author-role]"
 # Collapsed thinking panels hold the reasoning; both locales ship a toggle.
 EXPAND_LABELS = ("더 보기", "Show more")
 ASSISTANT_SELECTOR = '[data-message-author-role="assistant"]'
@@ -58,12 +65,24 @@ def conversation_id(url: str) -> str:
 
 
 def find_page(pages, url: str):
-    """The open page showing *url*, matched by conversation id, not by string."""
+    """The open page showing *url*, or None when nothing has it open."""
     wanted = conversation_id(url)
     for page in pages:
         if wanted in getattr(page, "url", ""):
             return page
-    raise SalvageError(f"conversation {wanted} is not open in the browser")
+    return None
+
+
+def open_conversation(context, url: str):
+    """Open *url* in a new tab and wait for its turns to render."""
+    page = context.new_page()
+    page.goto(url, wait_until="domcontentloaded", timeout=OPEN_TIMEOUT_MS)
+    for _ in range(TURN_POLL_TRIES):
+        if page.query_selector_all(ANY_TURN):
+            break
+        time.sleep(TURN_POLL_SECONDS)
+    time.sleep(SETTLE_SECONDS)  # the last turn streams in after the first paint
+    return page
 
 
 def read_page(page) -> Reading:
@@ -112,19 +131,33 @@ def write(url: str, reading: Reading, out_dir: Path) -> Salvaged:
 
 def salvage(url: str, out_dir: Path, *, pages=None, endpoint: str = CDP_ENDPOINT,
             reader=read_page) -> Salvaged:
-    """Salvage *url* into *out_dir*.
+    """Salvage *url* into *out_dir*, opening the conversation if it is closed.
 
     ``pages`` exists because playwright's pages are only usable inside the
     session that opened them: a caller (or a test) that already holds pages
     passes them in, everyone else gets a CDP connection opened here.
     """
+    conversation_id(url)  # reject a non-conversation before touching the browser
     if pages is not None:
-        return write(url, reader(find_page(pages, url)), out_dir)
+        page = find_page(pages, url)
+        if page is None:
+            raise SalvageError(f"conversation {conversation_id(url)} is not open in the browser")
+        return write(url, reader(page), out_dir)
 
     from playwright.sync_api import sync_playwright  # CDP is optional at import time
 
     with sync_playwright() as playwright:
         browser = playwright.chromium.connect_over_cdp(endpoint)
-        open_pages = [page for context in browser.contexts for page in context.pages]
-        reading = reader(find_page(open_pages, url))
+        contexts = browser.contexts
+        if not contexts:
+            raise SalvageError(f"no browser context on {endpoint}")
+        page = find_page([page for context in contexts for page in context.pages], url)
+        opened = page is None
+        if opened:
+            page = open_conversation(contexts[0], url)
+        try:
+            reading = reader(page)
+        finally:
+            if opened:
+                page.close()
     return write(url, reading, out_dir)

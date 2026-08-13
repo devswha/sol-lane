@@ -35,6 +35,8 @@ class FakePage:
         self._streaming = streaming
 
     def query_selector_all(self, selector: str):
+        if selector == salvage_module.ANY_TURN:
+            return self._assistants or [FakeElement("user turn")]
         if selector == salvage_module.ASSISTANT_SELECTOR:
             return self._assistants
         if self._expander_label and f'"{self._expander_label}"' in selector:
@@ -64,9 +66,9 @@ def test_find_page_matches_on_the_conversation_id():
     assert salvage_module.find_page(pages, URL) is wanted
 
 
-def test_a_conversation_that_is_not_open_is_refused():
-    with pytest.raises(salvage_module.SalvageError, match="not open in the browser"):
-        salvage_module.find_page([], URL)
+def test_find_page_reports_nothing_rather_than_failing():
+    """Closed is the normal case: the engine closes its page when the run ends."""
+    assert salvage_module.find_page([], URL) is None
 
 
 def test_the_answer_is_preferred_over_the_whole_page():
@@ -123,3 +125,39 @@ def test_salvage_reads_pages_it_is_handed_without_a_browser(tmp_path: Path):
 
     assert result.assistant_turns == 1
     assert "P1: the gate can be replaced" in result.path.read_text(encoding="utf-8")
+
+
+class FakeContext:
+    """A context that can open a page, like the browser does when the run ended."""
+
+    def __init__(self, page):
+        self._page = page
+        self.opened = []
+
+    def new_page(self):
+        self.opened.append(self._page)
+        return self._page
+
+
+def test_a_closed_conversation_is_opened_and_closed_again(monkeypatch):
+    page = FakePage(URL, assistants=("the answer",))
+    page.goto_calls = []
+    page.closed = False
+    page.goto = lambda url, **kwargs: page.goto_calls.append(url)
+    page.close = lambda: setattr(page, "closed", True)
+    context = FakeContext(page)
+
+    opened = salvage_module.open_conversation(context, URL)
+
+    assert opened is page
+    assert page.goto_calls == [URL]
+
+
+def test_salvage_refuses_a_url_that_is_not_a_conversation(tmp_path: Path):
+    with pytest.raises(salvage_module.SalvageError, match="not a conversation URL"):
+        salvage_module.salvage("https://chatgpt.com/", tmp_path, pages=[])
+
+
+def test_salvage_over_handed_pages_still_requires_the_page(tmp_path: Path):
+    with pytest.raises(salvage_module.SalvageError, match="not open in the browser"):
+        salvage_module.salvage(URL, tmp_path, pages=[])

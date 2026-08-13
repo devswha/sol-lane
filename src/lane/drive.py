@@ -186,7 +186,7 @@ def gate_digests(root: Path, gate: str, globs: Sequence[str]) -> dict[str, str]:
     that; a hash taken before the implementation runs can.
     """
     digests: dict[str, str] = {}
-    for pattern in (*globs, *_gate_command_files(root, gate)):
+    for pattern in globs:
         for path in root.glob(pattern):
             relative = path.relative_to(root)
             if any(part in GENERATED_PATHS for part in relative.parts):
@@ -194,6 +194,14 @@ def gate_digests(root: Path, gate: str, globs: Sequence[str]) -> dict[str, str]:
             if path.suffix in GENERATED_SUFFIXES or not path.is_file():
                 continue
             digests[relative.as_posix()] = _file_digest(path)
+    # The gate's own executable is the verification, wherever it lives. Skipping
+    # .venv keeps generated noise out of the protected globs; applied here it
+    # would exempt `.venv/bin/pytest` from the freeze, and a gate rewritten to
+    # exit 0 passes both integrity checks. (Sol Pro, reviewing this file.)
+    for name in _gate_command_files(root, gate):
+        path = root / name
+        if path.is_file():
+            digests[name] = _file_digest(path)
     return digests
 
 
@@ -227,7 +235,8 @@ def _gate_command_files(root: Path, gate: str) -> list[str]:
 
 
 def gate_tampering(before: Mapping[str, str], after: Mapping[str, str], *,
-                   sealed: tuple[str, ...] = GATE_SEALED_NAMES) -> list[str]:
+                   sealed: tuple[str, ...] = GATE_SEALED_NAMES,
+                   sealed_paths: Sequence[str] = ()) -> list[str]:
     """Protected paths the implementation rewrote, removed, or newly planted.
 
     Adding a test module is legitimate. Adding a conftest.py is not: a fresh
@@ -243,12 +252,17 @@ def gate_tampering(before: Mapping[str, str], after: Mapping[str, str], *,
     for path in sorted(set(after) - set(before)):
         if Path(path).name in sealed:
             problems.append(f"{path} (added; rewires the tests that already exist)")
+        elif path in sealed_paths:
+            # A gate command naming a file that did not exist made the pre-flight
+            # gate red; creating it now is writing the verdict, not earning it.
+            problems.append(f"{path} (added; the gate command runs it)")
     return problems
 
 
 def assert_verification_intact(baseline: Mapping[str, str], root: Path, gate: str,
                                protected: Sequence[str], *, when: str) -> None:
-    problems = gate_tampering(baseline, gate_digests(root, gate, protected))
+    problems = gate_tampering(baseline, gate_digests(root, gate, protected),
+                              sealed_paths=_gate_command_files(root, gate))
     if not problems:
         return
     raise DriveError(

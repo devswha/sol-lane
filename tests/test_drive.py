@@ -421,3 +421,68 @@ def test_gate_timeout_defaults_to_a_bound_not_to_forever(write_config):
 def test_a_zero_gate_timeout_is_refused(write_config):
     with pytest.raises(config.ConfigError, match="gate_timeout must be positive"):
         config.load(write_config(extra="gate_timeout = 0\n"))
+
+
+def venv_gate_repo(root: Path) -> Path:
+    """A repo whose gate is the interpreter's own pytest, as many projects run it."""
+    make_verified_repo(root)
+    runner = root / ".venv" / "bin" / "pytest"
+    runner.parent.mkdir(parents=True)
+    runner.write_text("#!/bin/sh\nexec python -m pytest \"$@\"\n", encoding="utf-8")
+    return runner
+
+
+def test_the_gate_runner_is_frozen_even_inside_a_generated_path(tmp_path: Path):
+    """Sol Pro, reviewing this file 2026-08-13: skipping .venv is noise control,
+    and applying it to the gate's own executable exempts the verification from
+    the freeze. Rewrite .venv/bin/pytest to exit 0 and both checks passed."""
+    runner = venv_gate_repo(tmp_path)
+    gate = ".venv/bin/pytest -q"
+
+    digests = drive_module.gate_digests(tmp_path, gate, config.DEFAULT_GATE_PROTECTED)
+
+    assert ".venv/bin/pytest" in digests, "the gate runner decides the verdict"
+    assert not any(path.startswith(".venv/lib") for path in digests), "only the runner, not the venv"
+
+    runner.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    after = drive_module.gate_digests(tmp_path, gate, config.DEFAULT_GATE_PROTECTED)
+
+    assert drive_module.gate_tampering(digests, after) == [".venv/bin/pytest (rewritten)"]
+
+
+def test_a_rewritten_gate_runner_stops_the_drive_before_the_verdict(tmp_path: Path):
+    runner = venv_gate_repo(tmp_path)
+    gate_calls = []
+
+    def gate_runner():
+        gate_calls.append(1)
+        return (False, "red before work") if len(gate_calls) == 1 else (True, "exit 0")
+
+    def implementer(plan, first):
+        runner.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        (tmp_path / "src.py").write_text("value = 2\n", encoding="utf-8")
+
+    with pytest.raises(drive_module.DriveError, match=r"\.venv/bin/pytest \(rewritten\)"):
+        drive_module.drive(tmp_path, "task", ".venv/bin/pytest -q", max_iters=2,
+                           planner=lambda prompt: "plan", implementer=implementer,
+                           gate_runner=gate_runner, protected=config.DEFAULT_GATE_PROTECTED,
+                           log=lambda *_: None)
+    assert gate_calls == [1]
+
+
+def test_a_gate_script_created_by_the_implementation_is_refused(tmp_path: Path):
+    """The pre-flight gate was red because the script was missing. Creating it is
+    writing the verdict, not earning it."""
+    make_verified_repo(tmp_path)
+    gate = "./scripts/gate.sh"
+    (tmp_path / "scripts").mkdir()
+
+    def implementer(plan, first):
+        script = tmp_path / "scripts" / "gate.sh"
+        script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+
+    with pytest.raises(drive_module.DriveError, match=r"scripts/gate.sh \(added"):
+        drive_module.drive(tmp_path, "task", gate, max_iters=2,
+                           planner=lambda prompt: "plan", implementer=implementer,
+                           gate_runner=lambda: (False, "no such file"),
+                           protected=config.DEFAULT_GATE_PROTECTED, log=lambda *_: None)
