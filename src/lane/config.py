@@ -29,8 +29,11 @@ SECRET_DIR_PREFIXES = ("artifacts/private",)
 # the gate decides the verdict, so editing the gate is the cheapest way to fake
 # one. Repos that verify differently override this per project.
 DEFAULT_GATE_PROTECTED = [
-    "tests/**/*", "**/conftest.py", "pyproject.toml", "pytest.ini",
-    "setup.cfg", "tox.ini", "noxfile.py", "Makefile",
+    "tests/**/*", "**/conftest.py", "pyproject.toml", "pytest.ini", ".pytest.ini",
+    "setup.cfg", "setup.py", "tox.ini", "noxfile.py", "Makefile",
+    # `uv run pytest` resolves the interpreter and the dependency set from these,
+    # so they decide what the gate actually executes.
+    "uv.lock", "uv.toml", ".python-version",
 ]
 
 _REPO_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")

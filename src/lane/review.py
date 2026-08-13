@@ -30,8 +30,10 @@ MANIFEST_GLOB = ".insane-review/manifest_*.json"
 HARVEST_WAIT_SECONDS = 300
 CONVERSATION_RE = re.compile(r"/c/[0-9a-f]{8}[0-9a-f-]{4,}", re.IGNORECASE)
 X11_SOCKETS = "/tmp/.X11-unix/X*"
-# Measured: a 297 KB pack kept Pro reasoning past 20 minutes on one question,
-# while ~100 KB packs answer in two. Latency is not linear in pack size.
+# Measured over five long runs: 78 KB reasoned 37m, 164 KB 31m, 290 KB 40m. Pack
+# size does not set the latency — the question does — so this warning is a hint
+# about egress volume, not a defence against a turn that dies past the half hour.
+# force_answer_after is what bounds that; see lane.toml.
 PACK_WARN_BYTES = 200_000
 
 

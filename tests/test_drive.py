@@ -332,3 +332,70 @@ def test_an_implementation_that_adds_a_test_and_fixes_the_source_passes(tmp_path
 
     assert outcome.passed is True
     assert outcome.iterations == 1
+
+
+def test_a_planted_conftest_is_refused_even_though_it_is_a_new_file(tmp_path: Path):
+    """Found by the lane's own Sol Pro audit, 2026-08-13: freezing only the files
+    that already exist lets a fresh collection hook skip every one of them."""
+    make_verified_repo(tmp_path)
+    gate_calls = []
+
+    def gate_runner():
+        gate_calls.append(1)
+        return (False, "red before work") if len(gate_calls) == 1 else (True, "all skipped")
+
+    def implementer(plan, first):
+        (tmp_path / "conftest.py").write_text(
+            "def pytest_collection_modifyitems(items):\n    items.clear()\n", encoding="utf-8")
+
+    with pytest.raises(drive_module.DriveError, match=r"conftest.py \(added"):
+        drive_module.drive(tmp_path, "task", "uv run pytest -q", max_iters=2,
+                           planner=lambda prompt: "plan", implementer=implementer,
+                           gate_runner=gate_runner, protected=config.DEFAULT_GATE_PROTECTED,
+                           log=lambda *_: None)
+    assert gate_calls == [1], "the planted hook never got to produce a verdict"
+
+
+def test_a_new_test_module_is_still_allowed(tmp_path: Path):
+    make_verified_repo(tmp_path)
+    results = iter([(False, "red"), (True, "ok")])
+
+    def implementer(plan, first):
+        (tmp_path / "src.py").write_text("value = 2\n", encoding="utf-8")
+        (tmp_path / "tests" / "test_added.py").write_text("def test_added():\n    pass\n", encoding="utf-8")
+
+    outcome = drive_module.drive(tmp_path, "task", "uv run pytest -q", max_iters=2,
+                                planner=lambda prompt: "plan", implementer=implementer,
+                                gate_runner=lambda: next(results),
+                                protected=config.DEFAULT_GATE_PROTECTED, log=lambda *_: None)
+
+    assert outcome.passed is True
+
+
+def test_a_file_swapped_while_the_gate_runs_voids_the_verdict(tmp_path: Path):
+    """Second finding from the same audit: checking only before the run cannot
+    see the implementation's leftover process editing a test mid-collection."""
+    make_verified_repo(tmp_path)
+    calls = []
+
+    def gate_runner():
+        calls.append(1)
+        if len(calls) == 1:
+            return False, "red before work"
+        # whatever the implementation left behind wins the race with the runner
+        (tmp_path / "tests" / "test_thing.py").write_text("def test_thing():\n    pass\n",
+                                                         encoding="utf-8")
+        return True, "1 passed"
+
+    with pytest.raises(drive_module.DriveError, match="verdict is void"):
+        drive_module.drive(tmp_path, "task", "uv run pytest -q", max_iters=2,
+                           planner=lambda prompt: "plan",
+                           implementer=lambda plan, first: (tmp_path / "src.py").write_text("v = 2\n"),
+                           gate_runner=gate_runner, protected=config.DEFAULT_GATE_PROTECTED,
+                           log=lambda *_: None)
+
+
+def test_sealed_names_cover_the_runner_configuration():
+    for name in ("conftest.py", "pyproject.toml", "uv.lock", ".python-version", "Makefile"):
+        assert name in drive_module.GATE_SEALED_NAMES
+    assert "test_thing.py" not in drive_module.GATE_SEALED_NAMES

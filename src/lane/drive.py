@@ -26,6 +26,16 @@ from . import proc
 GENERATED_PATHS = (".git", ".ai-bridge", ".insane-review", ".venv", "__pycache__", ".pytest_cache")
 GENERATED_SUFFIXES = (".pyc", ".pyo")
 HASH_CHUNK_BYTES = 131072
+
+# Frozen paths may not change. These may not *appear* either: a new conftest.py,
+# runner config, or lockfile rewires how the tests that already exist are
+# collected and run, so "it only added files" is not harmless for them. A new
+# test module still is — a red gate does not turn green because a test was added.
+GATE_SEALED_NAMES = (
+    "conftest.py", "pytest.ini", ".pytest.ini", "tox.ini", "noxfile.py",
+    "setup.cfg", "setup.py", "pyproject.toml", "uv.toml", "uv.lock",
+    ".python-version", "Makefile",
+)
 # Redacting shorter values would turn ordinary words into noise.
 MIN_REDACTED_SECRET = 8
 
@@ -207,11 +217,13 @@ def _gate_command_files(root: Path, gate: str) -> list[str]:
     return files
 
 
-def gate_tampering(before: Mapping[str, str], after: Mapping[str, str]) -> list[str]:
-    """Protected paths the implementation rewrote or removed.
+def gate_tampering(before: Mapping[str, str], after: Mapping[str, str], *,
+                   sealed: tuple[str, ...] = GATE_SEALED_NAMES) -> list[str]:
+    """Protected paths the implementation rewrote, removed, or newly planted.
 
-    Only files that existed when the drive started are frozen: adding a test
-    cannot turn a red gate green, so new files are allowed.
+    Adding a test module is legitimate. Adding a conftest.py is not: a fresh
+    collection hook can skip or pass every existing test without touching a
+    single frozen file, which is the same false green by another route.
     """
     problems = []
     for path, digest in sorted(before.items()):
@@ -219,7 +231,22 @@ def gate_tampering(before: Mapping[str, str], after: Mapping[str, str]) -> list[
             problems.append(f"{path} (deleted)")
         elif after[path] != digest:
             problems.append(f"{path} (rewritten)")
+    for path in sorted(set(after) - set(before)):
+        if Path(path).name in sealed:
+            problems.append(f"{path} (added; rewires the tests that already exist)")
     return problems
+
+
+def assert_verification_intact(baseline: Mapping[str, str], root: Path, gate: str,
+                               protected: Sequence[str], *, when: str) -> None:
+    problems = gate_tampering(baseline, gate_digests(root, gate, protected))
+    if not problems:
+        return
+    raise DriveError(
+        f"the verification changed {when}: "
+        + ", ".join(problems[:5])
+        + (f" (+{len(problems) - 5} more)" if len(problems) > 5 else "")
+    )
 
 
 def worktree_fingerprint(root: Path, *, ignored: tuple[str, ...] = GENERATED_PATHS) -> str:
@@ -271,17 +298,16 @@ def drive(root: Path, intent: str, gate: str, *, max_iters: int, planner, implem
                 "implementation produced no repository change; "
                 "a gate verdict now would describe the previous state"
             )
-        tampering = gate_tampering(baseline, gate_digests(root, gate, protected))
-        if tampering:
-            raise DriveError(
-                "the implementation changed the verification it was supposed to satisfy: "
-                + ", ".join(tampering[:5])
-                + (f" (+{len(tampering) - 5} more)" if len(tampering) > 5 else "")
-                + "; the gate was not run"
-            )
+        assert_verification_intact(baseline, root, gate, protected,
+                                   when="before the gate could run, so the gate was not run")
 
         log(f"[{iteration}/{max_iters}] gate: {gate}")
         passed, output = gate_runner()
+        # The gate and whatever the implementation left running share the tree:
+        # a check that only happens before the run cannot see a file swapped
+        # underneath it while the tests were collecting.
+        assert_verification_intact(baseline, root, gate, protected,
+                                   when="while the gate was running, so its verdict is void")
         attempts.append(Attempt(iteration=iteration, plan_chars=len(plan_text),
                                 gate_passed=passed, gate_log=output))
         log(f"[{iteration}/{max_iters}] gate {'PASS' if passed else 'FAIL'}")
