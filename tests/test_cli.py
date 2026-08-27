@@ -1,26 +1,15 @@
 from __future__ import annotations
 
 import builtins
-import json
 from pathlib import Path
 
 from lane import cli
 from lane import engine as engine_module
 
 
-def vendored_engine(lane_repo: Path, sha: str = "deadbeef" * 5) -> Path:
+def vendored_engine(lane_repo: Path) -> Path:
     path = engine_module.engine_path(lane_repo)
     path.write_text("x = 1\n", encoding="utf-8")
-    engine_module.manifest_path(lane_repo).write_text(
-        json.dumps({
-            "repo": "fivetaku/insane-review",
-            "sha": sha,
-            "upstream_sha256": "",
-            "patches": [],
-            "engine_sha256": engine_module.digest(path),
-        }),
-        encoding="utf-8",
-    )
     return path
 
 
@@ -47,7 +36,7 @@ def test_review_without_a_vendored_engine_is_a_config_error(write_config, capsys
     config = write_config()
 
     assert cli.main(["--config", str(config), "review", "demo", "p", "--dry-run"]) == cli.EXIT_CONFIG
-    assert "lane engine sync" in capsys.readouterr().err
+    assert "git checkout" in capsys.readouterr().err
 
 
 def test_review_refuses_an_unknown_project(write_config, lane_repo: Path, capsys):
@@ -238,3 +227,4 @@ def test_followup_dry_run_targets_the_newest_conversation(write_config, lane_rep
     assert "--continue-chat" in out
     assert "manifest_review_9.json" in out
     assert "--include" not in out, "a follow-up must not repack the project"
+

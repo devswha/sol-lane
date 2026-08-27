@@ -81,10 +81,6 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--max-wait", type=int, help="override the configured max_wait")
     serve.add_argument("--force-answer-after", type=int, help="override the configured force_answer_after")
 
-    engine = sub.add_parser("engine", help="manage the pinned upstream engine")
-    engine_sub = engine.add_subparsers(dest="engine_command", required=True)
-    sync = engine_sub.add_parser("sync", help="fetch the pinned engine and apply vendor patches")
-    sync.add_argument("--refresh", action="store_true", help="re-download even when cached")
     return parser
 
 
@@ -112,8 +108,6 @@ def _dispatch(argv: list[str] | None) -> int:
             return _projects(config)
         if args.command == "doctor":
             return _doctor(config)
-        if args.command == "engine":
-            return _engine_sync(config, refresh=args.refresh)
         if args.command == "serve":
             return _serve(config, args)
         if args.command == "drive":
@@ -147,10 +141,10 @@ def _engine(config: Config) -> Path:
     override = os.environ.get(engine_module.OVERRIDE_ENV)
     notice = engine_module.override_notice(override)
     if notice:
-        # Loud on every run: a forgotten env var is how you review with the wrong
-        # tool while the manifest sits there proving nothing.
+        # Loud on every run: a forgotten env var is how you end up reviewing
+        # with an engine nobody committed or reviewed.
         print(f"lane: {notice}", file=sys.stderr)
-    return engine_module.resolve(_repo_root(config), override=override, pin=config.engine)
+    return engine_module.resolve(_repo_root(config), override=override)
 
 
 def _projects(config: Config) -> int:
@@ -167,7 +161,7 @@ def _doctor(config: Config) -> int:
 
     override = os.environ.get(engine_module.OVERRIDE_ENV)
     try:
-        engine_path = engine_module.resolve(root, override=override, pin=config.engine)
+        engine_path = engine_module.resolve(root, override=override)
         state = "override" if override else "ok"
         print(f"engine     {state:8} {engine_path}")
         notice = engine_module.override_notice(override)
@@ -198,13 +192,6 @@ def _doctor(config: Config) -> int:
     return EXIT_OK if problems == 0 else EXIT_CONFIG
 
 
-def _engine_sync(config: Config, *, refresh: bool) -> int:
-    result = engine_module.sync(_repo_root(config), config.engine, refresh=refresh)
-    applied = ", ".join(result.patches) if result.patches else "none"
-    print(f"engine     {result.engine}")
-    print(f"upstream   {config.engine.repo}@{config.engine.sha[:12]} ({result.upstream_bytes} bytes)")
-    print(f"patches    {applied}")
-    return EXIT_OK
 
 
 LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}

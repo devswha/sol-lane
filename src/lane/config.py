@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 import tomllib
 from fnmatch import fnmatch
 from dataclasses import dataclass
@@ -36,22 +35,10 @@ DEFAULT_GATE_PROTECTED = [
     "uv.lock", "uv.toml", ".python-version",
 ]
 
-_REPO_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
-_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
-
 
 class ConfigError(Exception):
     """Malformed configuration or an unsafe root. Maps to exit code 2."""
 
-
-@dataclass(frozen=True)
-class EnginePin:
-    repo: str
-    sha: str
-
-    @property
-    def raw_url(self) -> str:
-        return f"https://raw.githubusercontent.com/{self.repo}/{self.sha}/bin/pack_and_ask.py"
 
 
 @dataclass(frozen=True)
@@ -73,7 +60,6 @@ class Project:
 @dataclass(frozen=True)
 class Config:
     path: Path
-    engine: EnginePin
     defaults: dict[str, object]
     projects: dict[str, Project]
 
@@ -173,17 +159,11 @@ def load(path: Path) -> Config:
     except (OSError, tomllib.TOMLDecodeError) as error:
         raise ConfigError(f"cannot read {path}: {error}") from error
 
-    engine_table = raw.get("engine")
-    if not isinstance(engine_table, dict) or not engine_table.get("repo") or not engine_table.get("sha"):
-        raise ConfigError("[engine] requires both repo and sha")
-    repo, sha = str(engine_table["repo"]), str(engine_table["sha"])
-    if not _REPO_PATTERN.match(repo):
-        raise ConfigError("[engine] repo must be owner/name")
-    if not _SHA_PATTERN.match(sha):
-        # A branch name is a moving target and a path separator escapes the
-        # cache directory; a pin has to be a pin.
-        raise ConfigError("[engine] sha must be a full 40-character commit hash")
-    engine = EnginePin(repo=repo, sha=sha)
+    if "engine" in raw:
+        raise ConfigError(
+            "[engine] is gone: vendor/pack_and_ask.py is the engine's source of "
+            "truth now — remove the table"
+        )
 
     defaults = dict(_DEFAULTS)
     for key, value in (raw.get("defaults") or {}).items():
@@ -198,7 +178,7 @@ def load(path: Path) -> Config:
     projects = {}
     for name, table in project_tables.items():
         projects[name] = _project(name, table, defaults)
-    return Config(path=path, engine=engine, defaults=defaults, projects=projects)
+    return Config(path=path, defaults=defaults, projects=projects)
 
 
 def _project(name: str, table: object, defaults: dict[str, object]) -> Project:

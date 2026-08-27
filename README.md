@@ -22,7 +22,6 @@ lane review/drive/serve ──▶ vendor/pack_and_ask.py (CDP) ──▶ ChatGPT
 - **ChatGPT Pro 구독으로 로그인된 Chrome/Chromium**, CDP 디버그 포트 `9222`.
   없으면 `lane review`/`lane serve`가 엔진의 `--ensure-env`로 전용 프로필을
   띄워보고, 그래도 안 되면 멈춘다(첫 실행은 그 프로필에서 손으로 로그인해야 한다).
-- `patch` 바이너리 (`lane engine sync`가 쓴다)
 - 선택: `gjc` (`lane drive`의 구현자, Sol Pro 모드의 클라이언트),
   `codexpro` + `xclip`/`wl-copy` (`--paste` 레인)
 
@@ -31,7 +30,6 @@ lane review/drive/serve ──▶ vendor/pack_and_ask.py (CDP) ──▶ ChatGPT
 ```bash
 git clone <이 레포> && cd sol-lane
 uv sync --extra dev
-uv run lane engine sync      # 핀된 업스트림 엔진 다운로드 + vendor/patches 적용
 uv run lane doctor           # engine·browser·root 전부 ok면 준비 끝
 ```
 
@@ -62,14 +60,10 @@ root:myproj ok      /home/you/workspace/myproj-clean
 
 ## 설정 — `lane.toml`
 
-레포 루트의 `lane.toml` 하나가 전부다. `[engine]` 핀은 그대로 두고, 자기 프로젝트를
-`[projects.<이름>]`으로 추가한다.
+레포 루트의 `lane.toml` 하나가 전부다. 자기 프로젝트를 `[projects.<이름>]`으로
+추가한다.
 
 ```toml
-[engine]                     # 그대로 두면 된다 — 핀 + 패치는 검증된 조합이다
-repo = "fivetaku/insane-review"
-sha = "eaab0b0d9e7f7ff84d5f3601289128aa8e70eb69"
-
 [defaults]                   # 모든 프로젝트의 공통값 (프로젝트가 덮어쓴다)
 model = "pro"
 require_model = "GPT-5.6"
@@ -131,7 +125,6 @@ lane salvage <proj>                # 중단된 대화의 추론이라도 건진�
 lane serve                         # Sol Pro를 로컬 OpenAI 호환 엔드포인트로
 lane projects                      # 설정된 프로젝트 목록
 lane doctor                        # 환경 점검
-lane engine sync [--refresh]       # 핀 + 패치 재조립
 ```
 
 모든 서브커맨드가 `--dry-run`(review/drive/harvest/followup)과 고정 종료코드를 지원한다:
@@ -249,24 +242,22 @@ SOL_PRO_LOCAL_KEY=<긴-랜덤-토큰> uv run lane serve --host 0.0.0.0
 
 계약 전체(스트리밍·타임아웃·gjc 쪽 실측)는 [docs/sol-pro-mode.md](docs/sol-pro-mode.md).
 
-## 엔진은 핀 + 패치로 관리한다
+## 엔진은 이 레포가 본점이다
 
-엔진(`pack_and_ask.py`)은 ChatGPT DOM을 직접 다루므로 UI가 바뀔 때마다 로컬 수정이
-필요하다. 업스트림 기본 동작은 이 수정본을 `~/.cache/`에 두는데, 핀을 올리면 그대로
-사라진다. 여기서는 반대로 한다.
+엔진(`vendor/pack_and_ask.py`)은 ChatGPT DOM을 직접 다루므로 UI가 바뀔 때마다
+수정이 필요하다. 예전엔 업스트림 SHA를 핀하고 로컬 수정을 패치로 얹었지만,
+업스트림 추적을 끊었다 — 수정은 이제 이 파일에 직접 커밋되고, 이 레포가
+엔진의 단일 소스다. 소비자(oh-my-gajae-code)는 이 파일을 스크립트로 export해서
+받아간다.
 
-```
-lane.toml [engine] repo/sha   →  업스트림 원본 (vendor/.upstream/<sha>.py 캐시)
-vendor/patches/*.patch        →  버전 관리되는 로컬 수정
-lane engine sync              →  둘을 합쳐 vendor/pack_and_ask.py 생성 + 컴파일 검증
-```
+실행 시점의 검증은 컴파일 하나다: 브라우저를 몰기 직전에 파일이 존재하고
+파이썬으로 컴파일되는지 확인하고, 아니면 멈춘다. 다운로드는 일절 없다.
+`LANE_ENGINE=<경로>`로 커밋되지 않은 실험 엔진을 임시로 꽂을 수 있지만, 그
+우회는 매 실행마다 stderr에 경고를 찍는다.
 
-패치가 안 붙거나 결과가 컴파일되지 않으면 **아무것도 쓰지 않고 중단한다.** 실행
-시점에는 manifest(`vendor/engine.json`)가 핀·패치·결과물 해시의 일치를 증명해야
-엔진이 돈다. `LANE_ENGINE=<경로>`로 임시 엔진을 꽂을 수 있지만, 그 우회는 매 실행마다
-stderr에 경고를 찍는다.
+DOM 수정의 유래(구 패치 0001~0004가 왜 존재했는지)는
+[docs/field-notes.md](docs/field-notes.md#패치별-유래).
 
-각 패치가 왜 존재하는지는 [docs/field-notes.md](docs/field-notes.md#패치별-유래).
 
 ## 정밀도에 대한 기본값
 
@@ -300,7 +291,9 @@ uv run pytest -q        # 단위 + 샌드박스 전부 — Pro 메시지 0통, �
 3. ~~`lane drive` — 계획·구현·게이트 루프~~
 4. ~~엔진 핀 v0.6.1 + `lane harvest` + `lane salvage`~~
 5. ~~tool call 브리지~~
-6. insane-review 업스트림 반영 — [docs/field-notes.md](docs/field-notes.md#패치별-유래) 참고
+6. ~~insane-review 업스트림 반영 — 업스트림 추적을 끊고 엔진을 이 레포로
+   통합했다(2026-08-27). 유래는 [docs/field-notes.md](docs/field-notes.md#패치별-유래)~~
 7. 세션↔대화 매핑 — `serve`는 아직 호출마다 전체 트랜스크립트를 다시 렌더한다.
    조각(`--continue-chat`, `lane followup`)은 있고 serve 결선만 남았다.
 8. 선별·구조화 강화 — 파일 집합 자동 확정, 계획 스키마 검증.
+9. omg export — `vendor/pack_and_ask.py`를 oh-my-gajae-code로 내보내는 스크립트.

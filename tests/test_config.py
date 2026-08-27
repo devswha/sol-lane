@@ -47,7 +47,7 @@ def test_force_answer_after_must_stay_below_max_wait(write_config):
 def test_empty_include_is_rejected(lane_repo: Path, project_root: Path):
     path = lane_repo / "lane.toml"
     path.write_text(
-        '[engine]\nrepo = "o/r"\nsha = "' + "a" * 40 + '"\n\n[projects.demo]\n'
+        '[projects.demo]\n'
         f'root = "{project_root.as_posix()}"\ninclude = []\n',
         encoding="utf-8",
     )
@@ -56,23 +56,16 @@ def test_empty_include_is_rejected(lane_repo: Path, project_root: Path):
         load(path)
 
 
-def test_engine_pin_builds_the_raw_url(write_config):
-    sha = "0123456789abcdef" * 2 + "01234567"
-    config = load(write_config(sha=sha))
-
-    assert config.engine.raw_url == (
-        f"https://raw.githubusercontent.com/fivetaku/insane-review/{sha}/bin/pack_and_ask.py"
+def test_an_engine_table_is_rejected(lane_repo: Path, project_root: Path):
+    path = lane_repo / "lane.toml"
+    path.write_text(
+        '[engine]\nrepo = "o/r"\nsha = "' + "a" * 40 + '"\n\n[projects.demo]\n'
+        f'root = "{project_root.as_posix()}"\ninclude = ["src/**/*.py"]\n',
+        encoding="utf-8",
     )
 
-
-def test_a_moving_ref_is_not_a_pin(write_config):
-    with pytest.raises(ConfigError, match="full 40-character commit hash"):
-        load(write_config(sha="main"))
-
-
-def test_a_sha_with_a_path_separator_is_rejected(write_config):
-    with pytest.raises(ConfigError, match="full 40-character commit hash"):
-        load(write_config(sha="../../etc/passwd"))
+    with pytest.raises(ConfigError, match=r"\[engine\] is gone"):
+        load(path)
 
 
 def test_checked_root_refuses_a_root_holding_secrets(write_config, project_root: Path):
