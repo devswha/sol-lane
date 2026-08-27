@@ -947,6 +947,38 @@ MODEL_SWITCHER_SELECTORS = [
 # 실측(2026-07-10): pill 클릭 → menuitemradio(즉시/중간/높음/매우 높음/Pro=추론단계)
 #   + menuitem("GPT-5.6 Sol"=모델 서브메뉴 트리거). 트리거를 hover하면 모델 radio들
 #   (GPT-5.6 Sol/GPT-5.5/GPT-5.4/GPT-5.3/o3)이 같은 메뉴 DOM에 menuitemradio로 추가된다.
+# 2026-08 UI의 추론단계/성능 슬라이더 라벨은 로케일에 따라 'Light…최대/울트라'까지
+# 관측된다(omg 2026-08-19 실측). --model 값은 '의미'를 가리키고 엔진은 아래 별칭
+# 후보 중 실제 존재하는 라벨을 정확 매칭으로 선택/검증한다.
+EFFORT_ALIASES = {
+    "pro": ("pro", "최대", "울트라", "ultra", "max"),
+    "max": ("max", "최대", "pro", "울트라", "ultra"),
+    "ultra": ("ultra", "울트라", "pro", "최대", "max"),
+    "high": ("high", "높음"),
+    "medium": ("medium", "중간"),
+    "low": ("low", "light", "낮음"),
+    "light": ("light", "low", "낮음"),
+}
+
+
+def _effort_candidates(want: str) -> tuple[str, ...]:
+    key = want.strip().casefold()
+    if key in EFFORT_ALIASES:
+        return EFFORT_ALIASES[key]
+    return (want.strip(),)
+
+
+def _effort_matches(label: str, want_l: str) -> bool:
+    """Does *label* (the UI's effort string) denote the level *want_l* asks for?
+
+    Substring matching let a model name's 'Pro' satisfy a 'pro' request;
+    alias-aware exact matching on the label's own lines does not.
+    """
+    wanted = {c.casefold() for c in _effort_candidates(want_l)}
+    lines = [line.strip().casefold() for line in label.splitlines() if line.strip()]
+    whole = label.strip().casefold()
+    return whole in wanted or any(line in wanted for line in lines)
+
 EFFORT_ITEM_SELECTORS = ['[role="menuitemradio"]', '[role="menuitem"]', '[role="option"]']
 
 
@@ -962,11 +994,28 @@ def read_model_pills(page) -> list[str]:
     return out
 
 
-def _drive_effort_slider(page, slider, want_l: str):
+def _exact_effort_pill(page, want_l: str) -> str | None:
+    """정확히 그 추론단계 라벨만 반환 — 모델명이나 'Pro'를 우연히 포함한 pill은 제외.
+
+    want_l이 별칭 그룹('pro' 등)이면 그 후보 라벨들과 정확(casefold) 매칭한다.
+    '5.6 Sol + 줄바꿈 + 최대' 같은 pill은 줄 단위로만 인정한다(omg eaab0d8 이식).
+    """
+    wanted = {c.casefold() for c in _effort_candidates(want_l)}
+    for pill in read_model_pills(page):
+        lines = [line.strip() for line in pill.splitlines() if line.strip()]
+        for line in lines:
+            if line.casefold() in wanted:
+                return line[:40]
+    return None
+
+
+def _drive_effort_slider(page, slider, want_l: str) -> str | None:
     """추론단계가 목록이 아니라 슬라이더(role=slider, aria-valuenow 0..N)로 렌더되는 UI 대응.
 
-    2026-08 ChatGPT는 '더 빠르게 ↔ 더 똑똑하게' 5단 슬라이더로 바뀌었고 마지막 칸이 Pro다.
-    단계 이름은 composer pill이 실시간으로 반영하므로 그것을 판정 근거로 쓴다.
+    2026-08 ChatGPT는 '더 빠르게 ↔ 더 똑똑하게' 5단 슬라이더이고 로케일에 따라 마지막
+    칸이 '최대/울트라/Pro'로 표시된다. 단계 라벨은 composer pill이 실시간 반영하므로
+    그것을 판정 근거로 쓰되 정확 매칭만 인정한다. 'pro' 요청은 pill 매칭에 더해 슬라이더가
+    물리적 최상단(valuenow==valuemax)일 때만 성공 — 모델명의 'Pro' 오매칭 방지.
     반환: 선택된 단계 라벨(성공) 또는 None(실패 → 호출자가 fail-closed).
     """
     try:
@@ -978,11 +1027,11 @@ def _drive_effort_slider(page, slider, want_l: str):
             page.keyboard.press("ArrowLeft")
             time.sleep(0.35)
         for _ in range(9):
-            pills = read_model_pills(page)
-            label = (pills[0] or "").strip() if pills else ""
-            if label and want_l in label.lower():
-                return label[:40]
-            if slider.get_attribute("aria-valuenow") == slider.get_attribute("aria-valuemax"):
+            label = _exact_effort_pill(page, want_l)
+            at_maximum = slider.get_attribute("aria-valuenow") == slider.get_attribute("aria-valuemax")
+            if label and (want_l != "pro" or at_maximum):
+                return label
+            if at_maximum:
                 return None
             page.keyboard.press("ArrowRight")
             time.sleep(0.5)
@@ -1094,8 +1143,15 @@ def select_model(page, want: str, require_model: str | None = None) -> tuple[boo
     # 추론단계 클릭 대상 탐색 (현재 선택이 이미 원하는 단계면 클릭 불필요)
     clicked = None
 
+    # 2026-08 UI 실측: 라디오 목록 없이 '추론 수준/최대' 값 줄 + (키보드가 먹지 않는)
+    # 성능 슬라이더로 렌더될 때가 있다. 메뉴가 이미 목표 단계를 가리키면 조작 없이
+    # 그대로 인정한다 — 조작 불가능한 슬라이더를 억지로 밀다 전송을 놓치는 것보다 낫다.
+    if before["effort_checked"] and _effort_matches(before["effort_checked"], want_l):
+        clicked = f"already:{before['effort_checked']}"
+        print(f"  추론단계 이미 선택됨: {before['effort_checked']!r} (조작 생략)")
+
     # 목록형 추론단계가 없으면 슬라이더 UI다 — 밀어서 맞추고 검증은 기존 재오픈 경로에 맡긴다.
-    if not before["items"]:
+    if not clicked and not before["items"]:
         slider = None
         try:
             slider = page.query_selector('[role="slider"]')
@@ -1118,14 +1174,6 @@ def select_model(page, want: str, require_model: str | None = None) -> tuple[boo
                 pass
             time.sleep(0.5)
 
-    if not clicked and before["effort_checked"] and want_l in before["effort_checked"].lower():
-        clicked = f"already:{before['effort_checked']}"
-        try:
-            # 검증용 재오픈이 열린 메뉴를 토글로 닫지 않도록 먼저 닫아둔다.
-            page.keyboard.press("Escape")
-            time.sleep(0.5)
-        except Exception:
-            pass
     cands = []
     if not clicked:
         for sel in EFFORT_ITEM_SELECTORS:
@@ -1180,11 +1228,21 @@ def select_model(page, want: str, require_model: str | None = None) -> tuple[boo
         return False, None
 
     # Pro 제안: 메뉴 재오픈하여 effort_checked 및 model_checked 상태 검증
+    already_selected = clicked.startswith("already:")
     if not _open_switcher(page):
-        print("  ⚠️  선택 상태 검증을 위해 메뉴 재오픈 실패")
-        return False, None
-
-    after = read_menu_state(page)
+        if not already_selected:
+            print("  ⚠️  선택 상태 검증을 위해 메뉴 재오픈 실패")
+            return False, None
+        print("  ⚠️  메뉴 재오픈 실패 — 조작이 없었으므로 최초 메뉴 읽기로 검증한다")
+        after = before
+    else:
+        after = read_menu_state(page)
+        # 2026-08-27 실측: 이 UI는 Escape 후 재오픈이 빈 메뉴를 준다(포털이 재마운트).
+        # 조작이 없었던 already 경로는 before==after가 논리적으로 보장되므로 최초 읽기로
+        # 검증한다. 조작했던 경로가 빈 메뉴를 받으면 여전히 실패 — 효과를 확인할 길이 없다.
+        if already_selected and after["model"] is None and after["effort_checked"] is None:
+            print("  ⚠️  재오픈한 메뉴가 비어 있음 — 조작이 없었으므로 최초 메뉴 읽기로 검증한다")
+            after = before
     try:
         page.keyboard.press("Escape")
     except Exception:
@@ -1201,7 +1259,7 @@ def select_model(page, want: str, require_model: str | None = None) -> tuple[boo
         if name_ok and not src_ok:
             print(f"  ❌ 활성 모델 확정 불가(체크표시 없음 + 메뉴에 모델 {len(after['models'])}개: {after['models']}) → fail-closed")
 
-    effort_verified = after["effort_checked"] is not None and want_l in after["effort_checked"].lower()
+    effort_verified = after["effort_checked"] is not None and _effort_matches(after["effort_checked"], want_l)
     verified = model_verified and effort_verified
 
     verified_model = after["model"] or "Unknown Model"
