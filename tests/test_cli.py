@@ -264,3 +264,37 @@ def test_repair_refuses_a_missing_evidence_path(write_config, lane_repo: Path, t
     assert cli.main(["--config", str(config), "repair",
                      "--evidence", str(tmp_path / "gone.log")]) == cli.EXIT_CONFIG
     assert "not found" in capsys.readouterr().err
+
+
+def test_review_stream_flag_reaches_the_engine_command(write_config, lane_repo: Path, capsys):
+    config = write_config()
+    vendored_engine(lane_repo)
+
+    assert cli.main(["--config", str(config), "review", "demo", "q", "--stream",
+                     "--dry-run"]) == cli.EXIT_OK
+    out = capsys.readouterr().out
+    assert "--stream" in out
+    assert "--prompt" in out, "streaming stays a review, not a council one-liner"
+
+    cli.main(["--config", str(config), "review", "demo", "q", "--dry-run"])
+    assert "--stream" not in capsys.readouterr().out
+
+
+def test_engine_export_copies_the_committed_engine_with_provenance(
+        write_config, lane_repo: Path, tmp_path: Path, capsys):
+    import json
+
+    config = write_config()
+    engine = vendored_engine(lane_repo)
+    destination = tmp_path / "consumer" / "pack_and_ask.py"
+
+    assert cli.main(["--config", str(config), "engine", "export",
+                     str(destination)]) == cli.EXIT_OK
+
+    assert destination.read_bytes() == engine.read_bytes()
+    provenance = json.loads(
+        destination.with_name("pack_and_ask.py.provenance.json").read_text(encoding="utf-8"))
+    assert provenance["sha256"] == engine_module.digest(engine)
+    assert provenance["source"] == "sol-lane vendor/pack_and_ask.py"
+    out = capsys.readouterr().out
+    assert "engine     " in out and "provenance" in out

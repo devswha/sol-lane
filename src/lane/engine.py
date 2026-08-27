@@ -17,6 +17,11 @@ door, so every run that uses an override says so.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import shutil
+import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .config import ConfigError
@@ -79,3 +84,39 @@ def _verify_compiles(path: Path) -> None:
         compile(source, str(path), "exec")
     except (OSError, SyntaxError) as error:
         raise EngineError(f"engine does not compile: {error}") from error
+
+
+def export(repo_root: Path, destination: Path) -> dict[str, str]:
+    """Copy the committed engine to a consumer checkout and prove what left.
+
+    The one consumer today is oh-my-gajae-code, whose plugin ships its own
+    engine copy; this is the mechanical export that keeps the two from
+    drifting. The copy is byte-exact and a sidecar provenance file records
+    the digest, the exporting commit, and the time, so the receiving side
+    can always answer "which engine is this?".
+    """
+    source = resolve(repo_root)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source, destination)
+    provenance = {
+        "source": "sol-lane vendor/pack_and_ask.py",
+        "sha256": digest(source),
+        "source_commit": _git_commit(repo_root),
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+    }
+    sidecar = destination.with_name(destination.name + ".provenance.json")
+    sidecar.write_text(json.dumps(provenance, indent=2) + "\n", encoding="utf-8")
+    return provenance
+
+
+def digest(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _git_commit(repo_root: Path) -> str:
+    try:
+        result = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo_root,
+                                capture_output=True, text=True, timeout=10, check=True)
+        return result.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return "unknown (not a git checkout or git failed)"

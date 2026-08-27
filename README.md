@@ -118,12 +118,14 @@ retry      lane harvest myproj   # no new message is sent
 lane review <proj> "<질문>"        # 패킹 → 전송 → 검증된 응답 저장
 lane review <proj> "<질문>" --include "src/a.py,tests/test_a.py"
 lane review <proj> "<질문>" --paste    # CDP 없이 codexpro 번들 + 클립보드
+lane review <proj> "<질문>" --stream     # 생성 중인 응답을 실시간으로 중계
 lane drive  <proj> "<하고 싶은 일>"    # Pro가 계획, gjc가 구현, 게이트가 판정
 lane followup <proj> "<후속 질문>"     # 이미 컨텍스트가 있는 대화에 이어 묻기 (재패킹 없음)
 lane harvest <proj>                # 값을 치른 대화에서 답만 회수 (전송 없음)
 lane salvage <proj>                # 중단된 대화의 추론이라도 건진다 (UNVERIFIED 표기)
 lane serve                         # Sol Pro를 로컬 OpenAI 호환 엔드포인트로
 lane repair [proj]                 # 엔진 실패 증거를 gjc 수리 세션에 넘긴다
+lane engine export <경로>           # 커밋된 엔진을 소비자(omg 등)로 복사+provenance
 lane projects                      # 설정된 프로젝트 목록
 lane doctor                        # 환경 점검
 ```
@@ -312,4 +314,5 @@ uv run pytest -q        # 단위 + 샌드박스 전부 — Pro 메시지 0통, �
 7. 세션↔대화 매핑 — `serve`는 아직 호출마다 전체 트랜스크립트를 다시 렌더한다.
    조각(`--continue-chat`, `lane followup`)은 있고 serve 결선만 남았다.
 8. 선별·구조화 강화 — 파일 집합 자동 확정, 계획 스키마 검증.
-9. omg export — `vendor/pack_and_ask.py`를 oh-my-gajae-code로 내보내는 스크립트.
+9. ~~omg export — `lane engine export <경로>`: 바이트 정확 복사 + provenance
+   사이드카(sha256·커밋·시각)로 oh-my-gajae-code 등 소비자에게 공급한다.~~

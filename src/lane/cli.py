@@ -40,6 +40,8 @@ def build_parser() -> argparse.ArgumentParser:
     review.add_argument("prompt")
     review.add_argument("--include", help="comma-separated globs overriding the configured set")
     review.add_argument("--paste", action="store_true", help="skip CDP; bundle for manual paste instead")
+    review.add_argument("--stream", action="store_true",
+                        help="relay the engine's live response chunks while Pro is thinking")
     review.add_argument("--dry-run", action="store_true", help="print the command instead of running it")
 
     drive = sub.add_parser("drive", help="Pro plans, gjc implements, the local gate decides")
@@ -82,6 +84,12 @@ def build_parser() -> argparse.ArgumentParser:
     repair.add_argument("--evidence", help="explicit failure log path instead of the newest one")
     repair.add_argument("--dry-run", action="store_true", help="print the brief and command, change nothing")
 
+
+    engine = sub.add_parser("engine", help="manage the vendored engine")
+    engine_sub = engine.add_subparsers(dest="engine_command", required=True)
+    engine_export = engine_sub.add_parser(
+        "export", help="copy the committed engine to a consumer checkout with provenance")
+    engine_export.add_argument("destination", help="path the engine copy is written to")
     serve = sub.add_parser("serve", help="expose Sol Pro as a local OpenAI-compatible endpoint")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8799)
@@ -117,6 +125,8 @@ def _dispatch(argv: list[str] | None) -> int:
             return _doctor(config)
         if args.command == "repair":
             return _repair(config, args)
+        if args.command == "engine":
+            return _engine_export(config, args)
         if args.command == "serve":
             return _serve(config, args)
         if args.command == "drive":
@@ -201,6 +211,13 @@ def _doctor(config: Config) -> int:
     return EXIT_OK if problems == 0 else EXIT_CONFIG
 
 
+def _engine_export(config: Config, args: argparse.Namespace) -> int:
+    destination = Path(args.destination).expanduser()
+    provenance = engine_module.export(_repo_root(config), destination)
+    print(f"engine     {destination}")
+    print(f"sha256     {provenance['sha256'][:16]}…  from {provenance['source_commit'][:12]}")
+    print(f"provenance {destination.with_name(destination.name + '.provenance.json')}")
+    return EXIT_OK
 
 
 LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
@@ -371,7 +388,8 @@ def _review(config: Config, args: argparse.Namespace) -> int:
 
     engine_path = _engine(config)
     if args.dry_run:
-        print(" ".join(review_module.command(engine_path, project, args.prompt, include=include)))
+        print(" ".join(review_module.command(engine_path, project, args.prompt, include=include,
+                                             stream=args.stream)))
         return EXIT_OK
 
     _report_pack_size(root, include or project.include)
@@ -383,7 +401,8 @@ def _review(config: Config, args: argparse.Namespace) -> int:
                   "start the dedicated profile or use --paste", file=sys.stderr)
             return EXIT_DELIVERY
 
-    outcome = review_module.run(engine_path, project, root, args.prompt, include=include)
+    outcome = review_module.run(engine_path, project, root, args.prompt, include=include,
+                                stream=args.stream)
     if outcome.returncode != 0 or outcome.response is None:
         print("lane: review did not produce a verified response (fail-closed)", file=sys.stderr)
         if outcome.reason:

@@ -72,7 +72,7 @@ class ReviewOutcome:
 
 
 def engine_args(project: Project, prompt: str, *, include: tuple[str, ...] | None = None,
-                council: bool = False) -> list[str]:
+                council: bool = False, stream: bool = False) -> list[str]:
     """Engine arguments for a correctness review.
 
     Deliberately never emits --compress or --remove-comments: they strip
@@ -98,13 +98,17 @@ def engine_args(project: Project, prompt: str, *, include: tuple[str, ...] | Non
         args.append("--delete-pack")
     if council:
         return [*args, "--council", prompt]
+    if stream:
+        # The engine's live-response chunks print as they arrive; run_relay
+        # forwards them, so a long Pro turn is watchable instead of silent.
+        args.append("--stream")
     return [*args, "--prompt", prompt]
 
 
 def command(engine: Path, project: Project, prompt: str, *, include: tuple[str, ...] | None = None,
-            python: str | None = None, council: bool = False) -> list[str]:
+            python: str | None = None, council: bool = False, stream: bool = False) -> list[str]:
     return [python or sys.executable, str(engine),
-            *engine_args(project, prompt, include=include, council=council)]
+            *engine_args(project, prompt, include=include, council=council, stream=stream)]
 
 
 def harvest_command(engine: Path, project: Project, source: str, *,
@@ -332,13 +336,15 @@ def harvest(engine: Path, project: Project, root: Path, source: str, *,
 
 
 def run(engine: Path, project: Project, root: Path, prompt: str, *,
-        include: tuple[str, ...] | None = None, python: str | None = None) -> ReviewOutcome:
+        include: tuple[str, ...] | None = None, python: str | None = None,
+        stream: bool = False) -> ReviewOutcome:
     assert_safe_pack(project, root, include or project.include)
     # Held across the harvest too: otherwise a concurrent run's response file
     # can be picked up as the answer to this prompt.
     with locks.exclusive(locks.browser_lock_path()):
         before = responses(root)
-        result = proc.run_relay(command(engine, project, prompt, include=include, python=python),
+        result = proc.run_relay(command(engine, project, prompt, include=include, python=python,
+                                        stream=stream),
                                 cwd=root, env=browser_env(),
                                 timeout=project.max_wait + 300)
         response = newest_new_response(root, before)
