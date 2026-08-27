@@ -1135,20 +1135,41 @@ def select_model(page, want: str, require_model: str | None = None) -> tuple[boo
                 continue
 
     if not clicked:
-        for exact in (True, False):
-            for it in cands:
-                try:
-                    t = (it.inner_text() or "").strip()
-                    low = t.lower()
-                    if (exact and low == want_l) or (not exact and want_l in low):
-                        it.click(force=True)
-                        clicked = t.splitlines()[0][:40]
-                        time.sleep(1.5)  # 클릭 후 드롭다운이 닫히는 시간 대기
-                        break
-                except Exception:
-                    continue
+        # 2026-08-19 omg 실측 이식: 서브메뉴 라디오는 React 재마운트로 ElementHandle이
+        # 떨어지고 actionability 대기가 영원히 안 걸린다 — 접근성 role locator +
+        # force 클릭을 먼저 시도한다(전달 즉시 서브메뉴가 닫히는 것이 정상 동작).
+        try:
+            loc = page.get_by_role("menuitemradio", name=want, exact=True)
+            if loc.count() == 0:
+                loc = page.get_by_role("option", name=want, exact=True)
+            if loc.count() == 0:
+                loc = page.get_by_role("menuitemradio", name=want)
+            if loc.count() > 0:
+                loc.first.click(force=True, timeout=5000)
+                clicked = want[:40]
+                time.sleep(1.5)
+        except Exception:
+            clicked = None
+    if not clicked:
+        # 폴백: role 이름 밖의 표현(부분 라벨/개행 포함) — 핸들 재조회로 재시도.
+        for _attempt in range(2):
+            for exact in (True, False):
+                for it in cands:
+                    try:
+                        t = (it.inner_text() or "").strip()
+                        low = t.lower()
+                        if (exact and low == want_l) or (not exact and want_l in low):
+                            it.click(force=True)
+                            clicked = t.splitlines()[0][:40]
+                            time.sleep(1.5)  # 클릭 후 드롭다운이 닫히는 시간 대기
+                            break
+                    except Exception:
+                        continue
+                if clicked:
+                    break
             if clicked:
                 break
+            time.sleep(0.3)
 
     if not clicked:
         print(f"  ⚠️  '{want}' 추론단계 항목 못 찾음 → 기본값")
@@ -1249,12 +1270,25 @@ SEND_BTN_SELECTORS = [
 def put_text(page, message: str):
     page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
     time.sleep(0.3)
-    page.evaluate(
-        """() => { const el = document.querySelector('#prompt-textarea')
-            || document.querySelector('div[contenteditable=\\"true\\"]');
-            if (el) { el.scrollIntoView({block:'center'}); el.focus(); } }"""
-    )
+    # 2026-08-19 omg 실측 이식: 메뉴 조작 뒤 포커스가 composer pill에 남아
+    # insert_text가 허공에 떨어진다 — 실제 클릭으로 composer에 진입하고,
+    # 잔여 draft를 지운 뒤 깨끗한 상태에서 입력한다.
+    el = find_input(page)
+    focused = False
+    if el is not None:
+        try:
+            el.click(force=True)
+            focused = True
+        except Exception:
+            focused = False
+    if not focused:
+        page.evaluate(
+            """() => { const el = document.querySelector('#prompt-textarea')
+                || document.querySelector('div[contenteditable=\\"true\\"]');
+                if (el) { el.scrollIntoView({block:'center'}); el.focus(); } }"""
+        )
     time.sleep(0.3)
+    clear_composer(page)
     # 크로스플랫폼: OS 클립보드/⌘V(맥 전용) 대신 Playwright 네이티브 insert_text(insertText 이벤트).
     # → mac/win/linux 동일 동작 + 동시 실행 시 클립보드 경합 제거. 실패 시 키 입력 폴백.
     try:
@@ -1293,18 +1327,27 @@ def composer_has_prompt(page, prompt: str) -> bool:
 
 
 def clear_composer(page):
-    """재입력 전 composer를 비운다(중복 입력 방지)."""
-    try:
-        page.evaluate(
-            """() => { const el = document.querySelector('#prompt-textarea')
-                || document.querySelector('div[contenteditable=\\"true\\"]');
-                if (el) { el.focus(); } }"""
-        )
-        page.keyboard.press("Meta+a")
-        page.keyboard.press("Backspace")
-        time.sleep(0.2)
-    except Exception:
-        pass
+    """재입력 전 composer를 비운다(중복 입력 방지).
+
+    select-all은 OS별 단축키를 쓴다 — Linux/Windows에선 Control+a(Meta+a는
+    Super키라 전체선택이 아니었다; 2026-08-19 omg 실측). 지워졌는지 읽어
+    확인하고, 안 비었으면 한 번 더 시도한다.
+    """
+    select_all = "Meta+a" if platform.system() == "Darwin" else "Control+a"
+    for _attempt in range(2):
+        try:
+            page.evaluate(
+                """() => { const el = document.querySelector('#prompt-textarea')
+                    || document.querySelector('div[contenteditable=\\"true\\"]');
+                    if (el) { el.focus(); } }"""
+            )
+            page.keyboard.press(select_all)
+            page.keyboard.press("Backspace")
+            time.sleep(0.2)
+            if not read_composer_text(page).strip():
+                return
+        except Exception:
+            pass
 
 
 def click_send(page) -> bool:
