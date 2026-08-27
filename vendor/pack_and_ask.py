@@ -1449,7 +1449,7 @@ def wait_for_turn_response(page, force_after=None, max_wait=None,
                            base_user: int = 0, base_assistant: int = 0, base_copy: int = 0,
                            conv_url: str | None = None, base_ids: set | None = None,
                            skip_sent_check: bool = False,
-                           on_bind=None) -> tuple[str, str, str | None]:
+                           on_bind=None, stream: bool = False) -> tuple[str, str, str | None]:
     """전송이 만든 '대화 URL' + message-id에 결속해 응답을 회수(v0.6.0 identity 결속).
     - conv_url: 이미 결속된 대화 URL(회수 재시도/harvest). None이면 전송 직후 SPA에서 포착.
     - base_ids: 전송 직전 DOM의 data-message-id 집합 — 신규 턴을 id 차집합으로 판정.
@@ -1459,6 +1459,8 @@ def wait_for_turn_response(page, force_after=None, max_wait=None,
     start = time.monotonic()
     last_status = 0
     force_tries = 0
+    streamed = ""       # --stream: 이미 stdout에 내보낸 접두부(중복 출력 방지)
+    stream_header = False
 
     # 1) 우리 user 턴이 '새로' 떴는지(count 증가 또는 대화 URL 발급). 안 떴으면 not_sent → 호출자가 재전송
     if not skip_sent_check:
@@ -1538,6 +1540,18 @@ def wait_for_turn_response(page, force_after=None, max_wait=None,
             last_status = elapsed
 
         if elapsed < MIN_WAIT_SECS or is_streaming(page):
+            # --stream: 생성 중인 텍스트를 증분 출력(완료 판정과 무관한 중계 전용).
+            # 재렌더로 접두가 바뀌면 조용히 재동기화(중복 출력 방지). omg eaab0d8 이식.
+            if stream:
+                live = last_assistant_text(page)
+                if live.startswith(streamed) and live != streamed:
+                    if not stream_header:
+                        print("    ── 실시간 응답(생성 중) ──")
+                        stream_header = True
+                    print(live[len(streamed):], end="", flush=True)
+                    streamed = live
+                elif not live.startswith(streamed):
+                    streamed = live
             stable_since = None
             time.sleep(2)
             continue
@@ -1815,6 +1829,8 @@ def main():
     ap.add_argument("--continue-chat", default=None, metavar="CHAT_URL|MANIFEST",
                     help="기존 대화에 후속 메시지를 보내고 그 턴만 회수(새 채팅 생성 없음)")
     ap.add_argument("--retries", type=int, default=1)
+    ap.add_argument("--stream", action="store_true",
+                    help="응답 생성 중인 텍스트를 stdout에 실시간 증분 출력(파이프/로그 중계용)")
     ap.add_argument("prompt_args", nargs="*", help="프롬프트(위치인자 — council 호환)")
     args = ap.parse_args()
 
@@ -2040,7 +2056,8 @@ def main():
                             page, force_after=args.force_answer_after, max_wait=mw_eff,
                             base_user=base_user, base_assistant=base_assistant,
                             base_copy=base_copy, conv_url=conv_url,
-                            base_ids=base_ids_snapshot, skip_sent_check=not sent_now)
+                            base_ids=base_ids_snapshot, skip_sent_check=not sent_now,
+                            stream=args.stream)
                         if status == "quota":
                             print("  ⛔ 사용량 한도 감지 — 회수 재시도 중단(한도 해제 후 --harvest 재실행)")
                             break
@@ -2143,7 +2160,8 @@ def main():
                             base_user=base_user, base_assistant=base_assistant,
                             base_copy=base_copy, base_ids=base_ids_snapshot,
                             on_bind=lambda url: write_run_manifest(
-                                manifest_path, url, label, run_tag, send_prompt, pack_path))
+                                manifest_path, url, label, run_tag, send_prompt, pack_path),
+                            stream=args.stream)
                         if conv_url:
                             # 전송 직후 디스크 영속화 — 프로세스가 죽어도 --harvest로 회수 가능(카운슬 P0 승격)
                             write_run_manifest(manifest_path, conv_url, label, run_tag, send_prompt, pack_path)
