@@ -19,6 +19,7 @@ from . import drive as drive_module
 from . import engine as engine_module
 from . import locks, proc
 from . import paste as paste_module
+from . import repair as repair_module
 from . import review as review_module
 from . import salvage as salvage_module
 from . import serve as serve_module
@@ -74,6 +75,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("projects", help="list configured projects")
     sub.add_parser("doctor", help="check engine, browser, and project roots")
+    repair = sub.add_parser(
+        "repair", help="hand the newest engine failure to a gjc repair session")
+    repair.add_argument("project", nargs="?",
+                        help="look for evidence under this project (default: all projects)")
+    repair.add_argument("--evidence", help="explicit failure log path instead of the newest one")
+    repair.add_argument("--dry-run", action="store_true", help="print the brief and command, change nothing")
 
     serve = sub.add_parser("serve", help="expose Sol Pro as a local OpenAI-compatible endpoint")
     serve.add_argument("--host", default="127.0.0.1")
@@ -108,6 +115,8 @@ def _dispatch(argv: list[str] | None) -> int:
             return _projects(config)
         if args.command == "doctor":
             return _doctor(config)
+        if args.command == "repair":
+            return _repair(config, args)
         if args.command == "serve":
             return _serve(config, args)
         if args.command == "drive":
@@ -123,7 +132,7 @@ def _dispatch(argv: list[str] | None) -> int:
         print(f"lane: {error}", file=sys.stderr)
         return EXIT_CONFIG
     except (paste_module.PasteError, review_module.ReviewError, drive_module.DriveError,
-            salvage_module.SalvageError, locks.LockBusy) as error:
+            repair_module.RepairError, salvage_module.SalvageError, locks.LockBusy) as error:
         print(f"lane: {error}", file=sys.stderr)
         return EXIT_DELIVERY
 
@@ -416,6 +425,57 @@ def _harvest(config: Config, args: argparse.Namespace) -> int:
         print("lane: nothing to harvest from that conversation yet", file=sys.stderr)
         return EXIT_DELIVERY
     print(f"response   {outcome.response}")
+    return EXIT_OK
+
+
+def _repair(config: Config, args: argparse.Namespace) -> int:
+    """A dead engine is a repair brief, not a console scrollback hunt."""
+    repo_root = _repo_root(config)
+    engine_path = _engine(config)
+
+    if args.evidence:
+        evidence = Path(args.evidence).expanduser()
+        if not evidence.is_file():
+            raise ConfigError(f"evidence log not found: {evidence}")
+        project_name = args.project or "(explicit evidence)"
+    else:
+        roots = []
+        if args.project:
+            project = config.project(args.project)
+            roots.append(checked_root(project))
+        else:
+            for name in sorted(config.projects):
+                project = config.projects[name]
+                if project.root.expanduser().is_dir():
+                    roots.append(project.root.expanduser())
+        evidence = repair_module.newest_failure(roots)
+        if evidence is None:
+            where = f"under {', '.join(str(root) for root in roots)}" if roots else "for any project"
+            print(f"lane: no failure evidence found {where} — a failed `lane review` writes "
+                  ".insane-review/failed_*.log; run one, or pass --evidence <log>", file=sys.stderr)
+            return EXIT_CONFIG
+        project_name = args.project or "(newest across projects)"
+
+    brief_text = repair_module.build_brief(evidence, engine_path, project_name=project_name)
+
+    if args.dry_run:
+        print(brief_text)
+        print("---")
+        placeholder = repo_root / repair_module.BRIEF_RELPATH
+        print(" ".join(repair_module.repair_command(repo_root, placeholder)))
+        return EXIT_OK
+
+    with locks.exclusive(repo_root / repair_module.REPAIR_LOCK, timeout=0):
+        brief = repair_module.write_brief(repo_root, brief_text)
+        print(f"brief      {brief}")
+        print(f"evidence   {evidence}")
+        outcome = repair_module.run_repair(repo_root, brief)
+    if outcome.returncode != 0:
+        print(f"lane: repair session exited {outcome.returncode}", file=sys.stderr)
+        print("brief      still on disk — re-run with --evidence to retry with the same evidence",
+              file=sys.stderr)
+        return EXIT_DELIVERY
+    print(outcome.report)
     return EXIT_OK
 
 

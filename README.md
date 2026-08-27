@@ -123,11 +123,12 @@ lane followup <proj> "<후속 질문>"     # 이미 컨텍스트가 있는 대�
 lane harvest <proj>                # 값을 치른 대화에서 답만 회수 (전송 없음)
 lane salvage <proj>                # 중단된 대화의 추론이라도 건진다 (UNVERIFIED 표기)
 lane serve                         # Sol Pro를 로컬 OpenAI 호환 엔드포인트로
+lane repair [proj]                 # 엔진 실패 증거를 gjc 수리 세션에 넘긴다
 lane projects                      # 설정된 프로젝트 목록
 lane doctor                        # 환경 점검
 ```
 
-모든 서브커맨드가 `--dry-run`(review/drive/harvest/followup)과 고정 종료코드를 지원한다:
+모든 서브커맨드가 `--dry-run`(review/drive/harvest/followup/repair)과 고정 종료코드를 지원한다:
 
 | 코드 | 의미 |
 |---|---|
@@ -258,6 +259,21 @@ SOL_PRO_LOCAL_KEY=<긴-랜덤-토큰> uv run lane serve --host 0.0.0.0
 DOM 수정의 유래(구 패치 0001~0004가 왜 존재했는지)는
 [docs/field-notes.md](docs/field-notes.md#패치별-유래).
 
+
+## 엔진이 죽으면 — `lane repair`
+
+ChatGPT DOM이 바뀌어 엔진이 fail-closed로 죽으면, 실패한 `lane review`는 엔진의
+마지막 출력을 `.insane-review/failed_*.log`로 남긴다. `lane repair`는 그 증거를
+브리프로 조립한다 — 무엇이 죽었는지, 고칠 파일(`vendor/pack_and_ask.py`), 지켜야
+할 불변식(fail-closed 유지, 네트워크 fetch 금지, 판당 전송 1회), 검증 사다리
+(pytest → doctor → `--check-env` 무료 프로브 → 실측 한 판) — 그리고 lane 전용
+세션의 gjc에게 넘긴다. 수리자는 커밋하지 않는다; 운영자가 diff를 본다.
+
+```bash
+lane repair              # 전체 프로젝트에서 가장 최근 실패 증거
+lane repair magi         # 그 프로젝트의 증거만
+lane repair --evidence <log> --dry-run   # 브리프만 확인
+```
 
 ## 정밀도에 대한 기본값
 

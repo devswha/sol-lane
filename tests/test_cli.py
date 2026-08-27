@@ -228,3 +228,39 @@ def test_followup_dry_run_targets_the_newest_conversation(write_config, lane_rep
     assert "manifest_review_9.json" in out
     assert "--include" not in out, "a follow-up must not repack the project"
 
+
+def test_repair_dry_run_prints_brief_and_command_without_writing(write_config, lane_repo: Path,
+                                                                  project_root: Path, capsys):
+    config = write_config()
+    vendored_engine(lane_repo)
+    evidence = project_root / ".insane-review"
+    evidence.mkdir(exist_ok=True)
+    (evidence / "failed_20260827_150000_abcd.log").write_text(
+        "# failed review run\n# exit 1\n❌ 컴포저를 찾을 수 없음\n", encoding="utf-8")
+
+    assert cli.main(["--config", str(config), "repair", "--dry-run"]) == cli.EXIT_OK
+    out = capsys.readouterr().out
+    assert "컴포저를 찾을 수 없음" in out
+    assert "vendor/pack_and_ask.py" in out
+    assert out.count("gjc -p") == 1
+    assert not list((lane_repo / ".ai-bridge").glob("repair-brief*")), \
+        "dry-run must not write anything"
+
+
+def test_repair_without_evidence_teaches_how_to_make_some(write_config, lane_repo: Path, capsys):
+    config = write_config()
+    vendored_engine(lane_repo)
+
+    assert cli.main(["--config", str(config), "repair"]) == cli.EXIT_CONFIG
+    err = capsys.readouterr().err
+    assert "failed_*.log" in err
+    assert "--evidence" in err
+
+
+def test_repair_refuses_a_missing_evidence_path(write_config, lane_repo: Path, tmp_path: Path, capsys):
+    config = write_config()
+    vendored_engine(lane_repo)
+
+    assert cli.main(["--config", str(config), "repair",
+                     "--evidence", str(tmp_path / "gone.log")]) == cli.EXIT_CONFIG
+    assert "not found" in capsys.readouterr().err

@@ -8,8 +8,10 @@ import os
 import re
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -22,6 +24,10 @@ class ReviewError(Exception):
 
 CDP_URL = "http://127.0.0.1:9222/json/version"
 RESPONSE_GLOB = ".insane-review/response_*.md"
+FAILURE_GLOB = ".insane-review/failed_*.log"
+# Enough of the engine's final words to localise a DOM break: the traceback or
+# the Korean error line sits in the last lines, not the progress log above it.
+FAILURE_TAIL_CHARS = 8000
 # The engine persists the bound conversation URL the moment the message is sent,
 # so a run that dies afterwards is recoverable without spending another one.
 MANIFEST_GLOB = ".insane-review/manifest_*.json"
@@ -332,10 +338,34 @@ def run(engine: Path, project: Project, root: Path, prompt: str, *,
     # can be picked up as the answer to this prompt.
     with locks.exclusive(locks.browser_lock_path()):
         before = responses(root)
-        result = proc.run(command(engine, project, prompt, include=include, python=python),
-                          cwd=root, env=browser_env(), capture=False)
+        result = proc.run_relay(command(engine, project, prompt, include=include, python=python),
+                                cwd=root, env=browser_env(),
+                                timeout=project.max_wait + 300)
         response = newest_new_response(root, before)
-    return _verified(result.returncode, response, prompt)
+    outcome = _verified(result.returncode, response, prompt)
+    if outcome.response is None:
+        persist_failure(root, result, outcome)
+    return outcome
+
+
+def persist_failure(root: Path, result: proc.Completed, outcome: ReviewOutcome) -> Path | None:
+    """Keep the engine's last words when a run fails closed.
+
+    The evidence feeds `lane repair`: a DOM break is diagnosed from the error
+    tail, which otherwise exists only on the console of the run that died.
+    """
+    text = result.stdout[-FAILURE_TAIL_CHARS:]
+    if not text.strip():
+        return None
+    directory = root / ".insane-review"
+    directory.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    tag = uuid.uuid4().hex[:8]
+    path = directory / f"failed_{stamp}_{tag}.log"
+    header = (f"# failed review run {stamp}_{tag}\n"
+              f"# exit {result.returncode}, reason: {outcome.reason or 'no verified response'}\n")
+    path.write_text(header + text, encoding="utf-8")
+    return path
 
 
 def _verified(returncode: int, response: Path | None, prompt: str) -> ReviewOutcome:

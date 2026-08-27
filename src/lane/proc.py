@@ -15,6 +15,7 @@ import os
 import selectors
 import signal
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -96,6 +97,36 @@ def run_tail(command: list[str] | str, *, cwd: Path | None = None, env: dict[str
             raise
     text = tail.decode("utf-8", "replace").strip()
     return Completed(returncode=process.returncode, stdout=text[-limit:], stderr="")
+
+
+def run_relay(command: list[str] | str, *, cwd: Path | None = None, env: dict[str, str] | None = None,
+              timeout: float | None = None) -> Completed:
+    """Run *command*, echoing its merged output live and returning it whole.
+
+    `run(capture=False)` shows progress but keeps nothing — the operator sees
+    an engine die, and the next process down the line has no evidence of why.
+    `run(capture=True)` keeps everything but shows nothing for the minutes a
+    review takes. This is both: lines are relayed as they arrive, and the full
+    merged text comes back for the caller to persist on failure.
+
+    Output is bounded by the caller dropping what it does not need; an
+    unbounded child is `run_tail`'s problem, not the review engine's.
+    """
+    deadline = None if timeout is None else time.monotonic() + timeout
+    with subprocess.Popen(command, cwd=cwd, env=env, text=True,
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          start_new_session=True) as process:
+        try:
+            chunks: list[str] = []
+            for line in process.stdout:
+                chunks.append(line)
+                sys.stdout.write(line)
+                sys.stdout.flush()
+            process.wait(None if deadline is None else max(deadline - time.monotonic(), 0.0))
+        except BaseException:  # timeout, SIGINT, SIGTERM-turned-SystemExit
+            _stop(process)
+            raise
+    return Completed(returncode=process.returncode, stdout="".join(chunks), stderr="")
 
 
 def _drain_tail(stream, *, keep: int, deadline: float | None = None) -> bytes:

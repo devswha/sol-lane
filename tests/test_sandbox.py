@@ -105,6 +105,10 @@ if args.harvest:
     sys.exit(0)
 
 # review mode (--prompt): the engine writes files instead of printing
+if "DIE" in (prompt or ""):
+    print("⏳ 전송 중")
+    print("❌ 컴포저를 찾을 수 없음 (composer selector matched nothing)")
+    sys.exit(1)
 write_response(REFUSAL if "REFUSE" in (prompt or "") else "the cache expiry holds; the lock covers the read path")
 sys.exit(0)
 '''
@@ -267,3 +271,46 @@ def test_drive_refuses_an_implementer_that_rewrites_the_gate(
     err = capsys.readouterr().err
     assert "check.py" in err and "rewritten" in err
     assert "the gate was not run" in err
+
+
+# ── lane repair ──────────────────────────────────────────────────────────────
+
+REPAIRING_GJC = (
+    "import pathlib, sys\n"
+    "# the honest repairer: read the brief, verify it names the evidence, report\n"
+    "brief = next(pathlib.Path('.ai-bridge').glob('repair-brief_*.md')).read_text(encoding='utf-8')\n"
+    "assert 'composer selector matched nothing' in brief, 'brief must carry the evidence'\n"
+    "assert 'pack_and_ask.py' in brief, 'brief must name the target'\n"
+    "print('repair session OK: brief read, evidence present')"
+)
+
+
+def test_a_failed_review_leaves_evidence_the_repairer_can_read(
+        write_config, stub_engine, online, project_root: Path, capsys):
+    """The engine's last words must survive the process that died."""
+    config = write_config()
+
+    assert cli.main(["--config", str(config), "review", "demo", "please DIE quietly"]) == cli.EXIT_DELIVERY
+
+    logs = list(project_root.glob(".insane-review/failed_*.log"))
+    assert logs, "a failed run wrote no evidence"
+    text = logs[0].read_text(encoding="utf-8")
+    assert "composer selector matched nothing" in text
+    assert text.startswith("# failed review run"), "the header names the exit and reason"
+
+
+def test_repair_hands_the_evidence_to_a_real_repairer_process(
+        write_config, stub_engine, tmp_path: Path, project_root: Path, monkeypatch, capsys):
+    config = write_config()
+    manifests = project_root / ".insane-review"
+    manifests.mkdir()
+    (manifests / "failed_20260827_150000_deadbeef.log").write_text(
+        "# failed review run 20260827_150000_deadbeef\n# exit 1, reason: no verified response\n"
+        "❌ 컴포저를 찾을 수 없음 (composer selector matched nothing)\n", encoding="utf-8")
+    fake_gjc(tmp_path, monkeypatch, REPAIRING_GJC)
+
+    assert cli.main(["--config", str(config), "repair"]) == cli.EXIT_OK
+
+    out = capsys.readouterr().out
+    assert "brief      " in out
+    assert "repair session OK" in out, "the repairer's report is the command's output"
