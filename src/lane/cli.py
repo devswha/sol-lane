@@ -401,6 +401,8 @@ def _review(config: Config, args: argparse.Namespace) -> int:
                   "start the dedicated profile or use --paste", file=sys.stderr)
             return EXIT_DELIVERY
 
+    manifest_before = review_module.newest_manifest(root)
+    stamp_before = manifest_before.stat().st_mtime_ns if manifest_before else None
     outcome = review_module.run(engine_path, project, root, args.prompt, include=include,
                                 stream=args.stream)
     if outcome.returncode != 0 or outcome.response is None:
@@ -409,16 +411,31 @@ def _review(config: Config, args: argparse.Namespace) -> int:
             print(f"reason     {outcome.reason}", file=sys.stderr)
         if outcome.rejected:
             print(f"rejected   {outcome.rejected}", file=sys.stderr)
-        _print_harvest_hint(root, project.name)
+        _print_harvest_hint(root, project.name,
+                            manifest_before=manifest_before, stamp_before=stamp_before)
         return EXIT_DELIVERY
     print(f"response   {outcome.response}")
     return EXIT_OK
 
 
-def _print_harvest_hint(root: Path, project: str) -> None:
-    """A spent message is not a lost one: name the retry that costs nothing."""
+def _print_harvest_hint(root: Path, project: str, *,
+                        manifest_before: Path | None, stamp_before: int | None) -> None:
+    """A spent message is not a lost one: name the retry that costs nothing.
+
+    The gate is a change, not a clock. The engine persists the bound
+    conversation the moment the message goes out, so a newest manifest that is
+    new or was rewritten during the run means a message is on the table. A
+    manifest that already existed unchanged belongs to an older conversation —
+    offering it here would harvest that run's answer and file it as the
+    response to this prompt (measured 2026-08-27: a fail-before-send run
+    pointed at an 08-13 conversation).
+    """
     manifest = review_module.newest_manifest(root)
-    conversation = review_module.conversation_of(manifest) if manifest else None
+    if manifest is None:
+        return
+    if manifest == manifest_before and manifest.stat().st_mtime_ns == stamp_before:
+        return
+    conversation = review_module.conversation_of(manifest)
     if conversation is None:
         return
     print(f"chat       {conversation}", file=sys.stderr)

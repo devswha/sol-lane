@@ -134,6 +134,35 @@ def test_a_failed_review_names_the_conversation_and_the_free_retry(
     vendored_engine(lane_repo)
     manifests = project_root / ".insane-review"
     manifests.mkdir(exist_ok=True)
+
+    from lane import review as review_module
+    monkeypatch.setattr(review_module, "cdp_up", lambda *a, **k: True)
+
+    def run_that_sent_then_died(*a, **k):
+        # The engine persists the bound conversation the moment the message
+        # goes out — a run failing after that has something to harvest.
+        (manifests / "manifest_review_1.json").write_text(
+            '{"chat_url": "https://chatgpt.com/c/6a7d67cb-cfb4-83ee-b43f-b2b3d842bb47"}',
+            encoding="utf-8")
+        return review_module.ReviewOutcome(returncode=1, response=None)
+
+    monkeypatch.setattr(review_module, "run", run_that_sent_then_died)
+
+    assert cli.main(["--config", str(config), "review", "demo", "audit"]) == cli.EXIT_DELIVERY
+    err = capsys.readouterr().err
+    assert "6a7d67cb-cfb4-83ee-b43f-b2b3d842bb47" in err
+    assert "lane harvest demo" in err
+
+
+def test_a_failure_before_send_offers_no_stale_harvest(
+        write_config, lane_repo: Path, project_root: Path, capsys, monkeypatch):
+    """Nothing was sent, so nothing can be harvested — a manifest that already
+    existed unchanged is an older conversation, not this prompt's recovery
+    (2026-08-27: a fail-before-send run pointed at an 08-13 conversation)."""
+    config = write_config()
+    vendored_engine(lane_repo)
+    manifests = project_root / ".insane-review"
+    manifests.mkdir(exist_ok=True)
     (manifests / "manifest_review_1.json").write_text(
         '{"chat_url": "https://chatgpt.com/c/6a7d67cb-cfb4-83ee-b43f-b2b3d842bb47"}', encoding="utf-8")
 
@@ -144,8 +173,8 @@ def test_a_failed_review_names_the_conversation_and_the_free_retry(
 
     assert cli.main(["--config", str(config), "review", "demo", "audit"]) == cli.EXIT_DELIVERY
     err = capsys.readouterr().err
-    assert "6a7d67cb-cfb4-83ee-b43f-b2b3d842bb47" in err
-    assert "lane harvest demo" in err
+    assert "lane harvest" not in err
+    assert "6a7d67cb" not in err
 
 
 def test_harvest_dry_run_sends_nothing(write_config, lane_repo: Path, capsys):
