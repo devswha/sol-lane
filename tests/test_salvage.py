@@ -7,7 +7,7 @@ import pytest
 
 from lane import salvage as salvage_module
 
-URL = "https://chatgpt.com/c/6a7d8344-5f60-83ea-a8c0-3d2c6a08ef07"
+URL = "https://chatgpt.com/c/0c3d4e5f-6078-89ab-cdef-234567890abc"
 
 
 class FakeElement:
@@ -52,7 +52,7 @@ class FakePage:
 
 
 def test_conversation_id_identifies_the_page_not_the_string():
-    assert salvage_module.conversation_id(URL) == "6a7d8344-5f60-83ea-a8c0-3d2c6a08ef07"
+    assert salvage_module.conversation_id(URL) == "0c3d4e5f-6078-89ab-cdef-234567890abc"
 
 
 def test_a_non_conversation_url_is_refused():

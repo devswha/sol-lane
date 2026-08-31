@@ -114,9 +114,9 @@ def test_newest_new_response_is_none_when_nothing_was_written(project_root: Path
 def test_harvest_command_sends_nothing(write_config, tmp_path: Path):
     """A harvest recovers an answer already paid for: no pack, no prompt, no send."""
     command = review_module.harvest_command(tmp_path / "engine.py", demo(write_config),
-                                           "https://chatgpt.com/c/6a7d67cb-cfb4-83ee-b43f-b2b3d842bb47")
+                                           "https://chatgpt.com/c/0a1b2c3d-4e5f-6789-abcd-0123456789ab")
 
-    assert command[command.index("--harvest") + 1].endswith("6a7d67cb-cfb4-83ee-b43f-b2b3d842bb47")
+    assert command[command.index("--harvest") + 1].endswith("0a1b2c3d-4e5f-6789-abcd-0123456789ab")
     for absent in ("--prompt", "--council", "--include", "--target", "--delete-pack"):
         assert absent not in command, f"{absent} would repack or resend"
     assert command[command.index("--require-model") + 1] == "GPT-5.6", "a harvest still verifies the model"

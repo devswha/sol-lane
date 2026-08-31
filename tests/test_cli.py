@@ -142,7 +142,7 @@ def test_a_failed_review_names_the_conversation_and_the_free_retry(
         # The engine persists the bound conversation the moment the message
         # goes out — a run failing after that has something to harvest.
         (manifests / "manifest_review_1.json").write_text(
-            '{"chat_url": "https://chatgpt.com/c/6a7d67cb-cfb4-83ee-b43f-b2b3d842bb47"}',
+            '{"chat_url": "https://chatgpt.com/c/0a1b2c3d-4e5f-6789-abcd-0123456789ab"}',
             encoding="utf-8")
         return review_module.ReviewOutcome(returncode=1, response=None)
 
@@ -150,7 +150,7 @@ def test_a_failed_review_names_the_conversation_and_the_free_retry(
 
     assert cli.main(["--config", str(config), "review", "demo", "audit"]) == cli.EXIT_DELIVERY
     err = capsys.readouterr().err
-    assert "6a7d67cb-cfb4-83ee-b43f-b2b3d842bb47" in err
+    assert "0a1b2c3d-4e5f-6789-abcd-0123456789ab" in err
     assert "lane harvest demo" in err
 
 
@@ -164,7 +164,7 @@ def test_a_failure_before_send_offers_no_stale_harvest(
     manifests = project_root / ".insane-review"
     manifests.mkdir(exist_ok=True)
     (manifests / "manifest_review_1.json").write_text(
-        '{"chat_url": "https://chatgpt.com/c/6a7d67cb-cfb4-83ee-b43f-b2b3d842bb47"}', encoding="utf-8")
+        '{"chat_url": "https://chatgpt.com/c/0a1b2c3d-4e5f-6789-abcd-0123456789ab"}', encoding="utf-8")
 
     from lane import review as review_module
     monkeypatch.setattr(review_module, "cdp_up", lambda *a, **k: True)
@@ -174,7 +174,7 @@ def test_a_failure_before_send_offers_no_stale_harvest(
     assert cli.main(["--config", str(config), "review", "demo", "audit"]) == cli.EXIT_DELIVERY
     err = capsys.readouterr().err
     assert "lane harvest" not in err
-    assert "6a7d67cb" not in err
+    assert "0a1b2c3d" not in err
 
 
 def test_harvest_dry_run_sends_nothing(write_config, lane_repo: Path, capsys):
@@ -249,7 +249,7 @@ def test_followup_dry_run_targets_the_newest_conversation(write_config, lane_rep
     manifests = project_root / ".insane-review"
     manifests.mkdir(exist_ok=True)
     (manifests / "manifest_review_9.json").write_text(
-        '{"chat_url": "https://chatgpt.com/c/6a7dac02-c75c-83ea-b372-5fe8b837addf"}', encoding="utf-8")
+        '{"chat_url": "https://chatgpt.com/c/0b2c3d4e-5f60-789a-bcde-123456789abc"}', encoding="utf-8")
 
     assert cli.main(["--config", str(config), "followup", "demo", "한 줄만", "--dry-run"]) == cli.EXIT_OK
     out = capsys.readouterr().out

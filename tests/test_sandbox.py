@@ -83,7 +83,7 @@ def write_response(body):
     with open(os.path.join(out, f"response_sandbox_{tag}.md"), "w", encoding="utf-8") as f:
         f.write("# review\\n- 모델: GPT-5.6\\n\\n---\\n" + body + "\\n")
     with open(os.path.join(out, f"manifest_sandbox_{tag}.json"), "w", encoding="utf-8") as f:
-        f.write('{"chat_url": "https://chatgpt.com/c/6a7d67cb-0000-4000-8000-%012d"}' % os.getpid())
+        f.write('{"chat_url": "https://chatgpt.com/c/5a5a5a5a-0000-4000-8000-%012d"}' % os.getpid())
 
 
 REFUSAL = "이 콘텐츠는 표시할 수 없습니다 (Trusted Access)"
@@ -175,7 +175,7 @@ def test_harvest_recovers_from_the_manifest_the_review_left_behind(
     manifests = project_root / ".insane-review"
     manifests.mkdir()
     (manifests / "manifest_review_1.json").write_text(
-        '{"chat_url": "https://chatgpt.com/c/6a7d67cb-cfb4-83ee-b43f-b2b3d842bb47"}',
+        '{"chat_url": "https://chatgpt.com/c/0a1b2c3d-4e5f-6789-abcd-0123456789ab"}',
         encoding="utf-8")
 
     assert cli.main(["--config", str(config), "harvest", "demo"]) == cli.EXIT_OK
