@@ -124,6 +124,7 @@ lane review <proj> "<질문>"        # 패킹 → 전송 → 검증된 응답 �
 lane review <proj> "<질문>" --include "src/a.py,tests/test_a.py"
 lane review <proj> "<질문>" --paste    # CDP 없이 codexpro 번들 + 클립보드
 lane review <proj> "<질문>" --stream     # 생성 중인 응답을 실시간으로 중계
+lane review --root <경로> "<질문>" --include "src/**"  # 등록 없이 그 워크트리 한 판 (ad-hoc)
 lane drive  <proj> "<하고 싶은 일>"    # Pro가 계획, gjc가 구현, 게이트가 판정
 lane followup <proj> "<후속 질문>"     # 이미 컨텍스트가 있는 대화에 이어 묻기 (재패킹 없음)
 lane harvest <proj>                # 값을 치른 대화에서 답만 회수 (전송 없음)

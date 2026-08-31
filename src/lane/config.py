@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import tomllib
+from collections.abc import Mapping
 from fnmatch import fnmatch
 from dataclasses import dataclass
 from pathlib import Path
@@ -69,6 +70,27 @@ class Config:
         except KeyError:
             known = ", ".join(sorted(self.projects)) or "none"
             raise ConfigError(f"unknown project {name!r}; configured: {known}") from None
+
+
+def adhoc_project(root: Path, defaults: Mapping[str, object]) -> Project:
+    """A one-shot project for `lane review --root`: this worktree, the shared
+    defaults, no registration. The include globs come from --include (the
+    caller names them); gate fields are inert because ad-hoc is review-only.
+    """
+    return Project(
+        name="adhoc",
+        root=root,
+        include=(),
+        gate=None,
+        model=str(defaults["model"]),
+        require_model=str(defaults["require_model"]),
+        force_answer_after=int(defaults["force_answer_after"]),
+        max_wait=int(defaults["max_wait"]),
+        no_project=bool(defaults["no_project"]),
+        delete_pack=bool(defaults["delete_pack"]),
+        gate_protected=(),
+        gate_timeout=int(defaults["gate_timeout"]),
+    )
 
 
 _DEFAULTS: dict[str, object] = {

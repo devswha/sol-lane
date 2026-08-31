@@ -327,3 +327,44 @@ def test_engine_export_copies_the_committed_engine_with_provenance(
     assert provenance["source"] == "sol-lane vendor/pack_and_ask.py"
     out = capsys.readouterr().out
     assert "engine     " in out and "provenance" in out
+
+
+def test_adhoc_root_reviews_an_unregistered_worktree(write_config, lane_repo: Path,
+                                                     project_root: Path, capsys):
+    """--root is the omg entry point: any worktree, no registration."""
+    config = write_config()
+    vendored_engine(lane_repo)
+
+    assert cli.main(["--config", str(config), "review", "test-question",
+                     "--root", str(project_root), "--include", "src/**/*.py",
+                     "--dry-run"]) == cli.EXIT_OK
+    out = capsys.readouterr().out
+    assert "--include src/**/*.py" in out
+    assert "test-question" in out
+
+
+def test_adhoc_root_requires_include(write_config, lane_repo: Path, project_root: Path):
+    config = write_config()
+    vendored_engine(lane_repo)
+
+    assert cli.main(["--config", str(config), "review", "q",
+                     "--root", str(project_root), "--dry-run"]) == cli.EXIT_CONFIG
+
+
+def test_adhoc_root_is_mutually_exclusive_with_a_project(write_config, lane_repo: Path, capsys):
+    config = write_config()
+
+    assert cli.main(["--config", str(config), "review", "demo", "q",
+                     "--root", ".", "--dry-run"]) == cli.EXIT_CONFIG
+    assert "mutually exclusive" in capsys.readouterr().err
+
+
+def test_adhoc_root_refuses_a_worktree_holding_secrets(write_config, lane_repo: Path,
+                                                       project_root: Path, capsys):
+    (project_root / ".env").write_text("TOKEN=x\n", encoding="utf-8")
+    config = write_config()
+
+    assert cli.main(["--config", str(config), "review", "q",
+                     "--root", str(project_root), "--include", "src/**/*.py",
+                     "--dry-run"]) == cli.EXIT_CONFIG
+    assert "holds secrets" in capsys.readouterr().err

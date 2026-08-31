@@ -23,7 +23,7 @@ from . import repair as repair_module
 from . import review as review_module
 from . import salvage as salvage_module
 from . import serve as serve_module
-from .config import Config, ConfigError, checked_root, find_config, load, secret_markers_in
+from .config import Config, ConfigError, adhoc_project, checked_root, find_config, load, secret_markers_in
 
 EXIT_OK = 0
 EXIT_DELIVERY = 1
@@ -36,8 +36,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     review = sub.add_parser("review", help="pack a project and get a Sol Pro review")
-    review.add_argument("project")
+    review.add_argument("project", nargs="?",
+                        help="configured project name, or omit with --root for a one-shot review")
     review.add_argument("prompt")
+    review.add_argument("--root", help="ad-hoc: review this worktree without registering a project "
+                                       "(requires --include)")
     review.add_argument("--include", help="comma-separated globs overriding the configured set")
     review.add_argument("--paste", action="store_true", help="skip CDP; bundle for manual paste instead")
     review.add_argument("--stream", action="store_true",
@@ -368,7 +371,18 @@ def _globs(value: str | None) -> tuple[str, ...] | None:
 
 
 def _review(config: Config, args: argparse.Namespace) -> int:
-    project = config.project(args.project)
+    if args.root:
+        if args.project:
+            raise ConfigError("--root and a project name are mutually exclusive")
+        include = _globs(args.include)
+        if not include:
+            raise ConfigError("--root needs --include: an ad-hoc pack is exactly what you name, "
+                              "not the whole tree")
+        project = adhoc_project(Path(args.root).expanduser().resolve(), config.defaults)
+    else:
+        if not args.project:
+            raise ConfigError("either a configured project name or --root is required")
+        project = config.project(args.project)
     root = checked_root(project)
     include = _globs(args.include)
 
