@@ -1,0 +1,24 @@
+# Sol Pro review lane — project registry.
+#
+# Copy to lane.toml (gitignored — your projects are yours) and fill in one
+# [projects.<name>] per review target.
+#
+# `root` MUST be a sanitized worktree. The lane refuses roots that carry
+# secrets (`.env*`, private keys, `artifacts/private/`) because the packed
+# context leaves the machine.
+
+[defaults]
+model = "pro"                  # effort level: the engine maps pro→최대/max
+require_model = "GPT-5.6"      # fail-closed unless the menu shows this model
+max_wait = 4200                # seconds; Pro can reason for 30+ minutes
+
+[projects.myproj]
+root = "~/workspace/myproj-clean"
+include = ["README.md", "src/**/*.py", "tests/**/*.py"]
+gate = "uv run pytest -q"      # `lane drive`'s verdict; omit for review-only lanes
+
+# Review-only lane (no gate), narrow pack:
+#
+# [projects.docs]
+# root = "~/workspace/docs-wt"
+# include = ["README.md", "docs/**/*.md"]

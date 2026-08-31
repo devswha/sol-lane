@@ -15,6 +15,10 @@ lane review/drive/serve ──▶ vendor/pack_and_ask.py (CDP) ──▶ ChatGPT
 메아리는 exit 0을 받지 못한다. 대신 이미 값을 치른 대화에서 답을 다시 긁는 경로
 (`harvest`/`salvage`)가 항상 열려 있다.
 
+> **면책.** 이 도구는 로그인된 ChatGPT 웹 세션을 CDP로 자동화한다 — 구독 약관이
+> 웹 UI 자동화를 보장하지 않으므로 **개인 구독·개인 계정 용도로만** 쓴다. 패킹된
+> 코드는 외부로 나간다: 루트 비밀 스캔은 그래서 실행 전에 fail-closed로 거부한다.
+
 ## 요구사항
 
 - **Linux** (프로세스 간 락이 abstract socket이라 다른 OS에선 동작하지 않는다)
@@ -28,9 +32,10 @@ lane review/drive/serve ──▶ vendor/pack_and_ask.py (CDP) ──▶ ChatGPT
 ## 설치
 
 ```bash
-git clone <이 레포> && cd sol-lane
+git clone https://github.com/devswha/sol-lane.git && cd sol-lane
 uv sync --extra dev
-uv run lane doctor           # engine·browser·root 전부 ok면 준비 끝
+cp lane.toml.example lane.toml   # 자기 프로젝트의 root·include로 고쳐라
+uv run lane doctor               # engine·browser 전부 ok면 준비 끝
 ```
 
 ### 첫 로그인 (새 머신에서 한 번만)
@@ -273,7 +278,7 @@ ChatGPT DOM이 바뀌어 엔진이 fail-closed로 죽으면, 실패한 `lane rev
 
 ```bash
 lane repair              # 전체 프로젝트에서 가장 최근 실패 증거
-lane repair magi         # 그 프로젝트의 증거만
+lane repair myproj         # 그 프로젝트의 증거만
 lane repair --evidence <log> --dry-run   # 브리프만 확인
 ```
 

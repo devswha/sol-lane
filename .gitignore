@@ -1,4 +1,7 @@
 .venv/
+
+# The operator's own project registry — lane.toml.example is the tracked one.
+lane.toml
 __pycache__/
 .pytest_cache/
 *.pyc
