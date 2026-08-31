@@ -1041,15 +1041,24 @@ def _drive_effort_slider(page, slider, want_l: str) -> str | None:
 
 
 def _open_switcher(page):
-    for sel in MODEL_SWITCHER_SELECTORS:
-        try:
-            el = page.query_selector(sel)
-            if el:
-                el.click()
-                time.sleep(1.2)
-                return True
-        except Exception:
-            continue
+    # 2026-08-31 실측: data-testid가 사라지고 pill 클래스도 hydration에 따라 늦게 붙는다.
+    # 클릭 성공 ≠ 메뉴 오픈이므로, 메뉴 항목이 실제로 보일 때까지 셀렉터를 순회 재시도한다.
+    selectors = MODEL_SWITCHER_SELECTORS + ['button.__composer-pill']
+    for _attempt in range(4):
+        for sel in selectors:
+            try:
+                el = page.query_selector(sel)
+                if el:
+                    el.click()
+                    time.sleep(1.2)
+                    try:
+                        if page.query_selector('[role="menuitem"], [role="menuitemradio"], [role="option"], [role="slider"]'):
+                            return True
+                    except Exception:
+                        pass
+            except Exception:
+                continue
+        time.sleep(0.6)
     return False
 
 
