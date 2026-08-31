@@ -114,6 +114,26 @@ def find_config(start: Path) -> Path:
     raise ConfigError(f"no {CONFIG_NAME} found at or above {start}")
 
 
+def repo_home() -> Path:
+    """The lane's own repository — where the committed engine lives.
+
+    src/lane/config.py -> two levels up. Stable regardless of cwd; used by
+    the ad-hoc path so a machine with the lane checked out anywhere can run
+    `lane review --root <any worktree>` without a lane.toml in sight.
+    """
+    return Path(__file__).resolve().parent.parent.parent
+
+
+def adhoc_config() -> Config:
+    """A defaults-only Config anchored at the lane's own repository.
+
+    No lane.toml is read or required: the shared defaults are built in, the
+    engine is the committed one at repo_home()/vendor, and every project
+    lookup fails loudly (there are no projects — pass --root).
+    """
+    return Config(path=repo_home() / CONFIG_NAME, defaults=dict(_DEFAULTS), projects={})
+
+
 def secret_markers_in(root: Path) -> list[str]:
     """Return the secret markers present under *root*, newest concern first."""
     found = []

@@ -23,7 +23,7 @@ from . import repair as repair_module
 from . import review as review_module
 from . import salvage as salvage_module
 from . import serve as serve_module
-from .config import Config, ConfigError, adhoc_project, checked_root, find_config, load, secret_markers_in
+from .config import Config, ConfigError, adhoc_config, adhoc_project, checked_root, find_config, load, secret_markers_in
 
 EXIT_OK = 0
 EXIT_DELIVERY = 1
@@ -121,7 +121,7 @@ def main(argv: list[str] | None = None) -> int:
 def _dispatch(argv: list[str] | None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        config = _load_config(args.config)
+        config = _load_config(args.config, adhoc_ok=args.command == "review" and bool(args.root))
         if args.command == "projects":
             return _projects(config)
         if args.command == "doctor":
@@ -150,9 +150,23 @@ def _dispatch(argv: list[str] | None) -> int:
         return EXIT_DELIVERY
 
 
-def _load_config(explicit: str | None) -> Config:
-    path = Path(explicit).expanduser() if explicit else find_config(Path.cwd())
-    return load(path)
+def _load_config(explicit: str | None, *, adhoc_ok: bool = False) -> Config:
+    """The nearest lane.toml — or, for `review --root`, built-in defaults.
+
+    Ad-hoc mode must work from any directory (omg calls it with --root from
+    foreign repos), so when no lane.toml exists anywhere above the cwd the
+    fallback is a defaults-only Config anchored at this repository, whose
+    committed engine is the one that runs. Non-adhoc commands keep failing
+    loudly on a missing config.
+    """
+    if explicit:
+        return load(Path(explicit).expanduser())
+    try:
+        return load(find_config(Path.cwd()))
+    except ConfigError:
+        if adhoc_ok:
+            return adhoc_config()
+        raise
 
 
 def _repo_root(config: Config) -> Path:

@@ -368,3 +368,25 @@ def test_adhoc_root_refuses_a_worktree_holding_secrets(write_config, lane_repo: 
                      "--root", str(project_root), "--include", "src/**/*.py",
                      "--dry-run"]) == cli.EXIT_CONFIG
     assert "holds secrets" in capsys.readouterr().err
+
+
+def test_adhoc_root_works_with_no_lane_toml_anywhere(lane_repo: Path, project_root: Path,
+                                                      capsys, monkeypatch, tmp_path: Path):
+    """The omg entry point: a foreign cwd with no config, --root still runs."""
+    vendored_engine(lane_repo)
+    empty_cwd = tmp_path / "foreign-repo"
+    empty_cwd.mkdir()
+    monkeypatch.chdir(empty_cwd)
+
+    assert cli.main(["review", "question", "--root", str(project_root),
+                     "--include", "src/**/*.py", "--dry-run"]) == cli.EXIT_OK
+    out = capsys.readouterr().out
+    assert "--prompt question" in out
+    assert "--require-model GPT-5.6" in out, "built-in defaults apply"
+
+
+def test_a_missing_config_still_fails_loudly_outside_adhoc(monkeypatch, tmp_path: Path, capsys):
+    monkeypatch.chdir(tmp_path)
+
+    assert cli.main(["projects"]) == cli.EXIT_CONFIG
+    assert "no lane.toml" in capsys.readouterr().err
