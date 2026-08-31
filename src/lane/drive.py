@@ -15,6 +15,8 @@ import hashlib
 import os
 import shlex
 import subprocess
+import tempfile
+from contextlib import contextmanager
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -109,25 +111,27 @@ def plan_request(intent: str, *, gate: str | None = None, failure: str | None = 
 
 
 def write_plan(root: Path, text: str) -> Path:
-    path = root / PLAN_RELPATH
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text if text.endswith("\n") else text + "\n", encoding="utf-8")
-    return path
+    relative = Path(PLAN_RELPATH)
+    return proc.atomic_write_text(
+        root / relative.parent,
+        relative.name,
+        text if text.endswith("\n") else text + "\n",
+    )
 
 
-def implement_command(root: Path, plan: Path, *, first: bool, session: str | None = None,
-                      timeout_ms: int = IMPLEMENT_TIMEOUT_SECONDS * 1000) -> list[str]:
+def implement_command(root: Path, plan: Path, *, first: bool,
+                      session: str | None = None) -> list[str]:
     """Command that makes gjc execute the plan.
 
-    Default path is a lane-owned headless session directory: `--continue` keeps
-    context across attempts without ever writing into a session the operator is
-    using. An explicit session id is the only way to target a live session.
+    `--continue` keeps context in a lane-owned session directory. A live SDK
+    session is not an isolation boundary and is deliberately unsupported.
     """
     if session:
-        return ["gjc", "sdk", "session", "send", "--session", session,
-                "--text", f"{IMPLEMENT_INSTRUCTION}\n\n{plan.read_text(encoding='utf-8')}",
-                "--wait", "--timeout-ms", str(timeout_ms)]
-    command = ["gjc", "-p", "--no-title", "--session-dir", str(root / SESSION_RELPATH)]
+        raise DriveError("implementer session must be lane-owned")
+    command = [
+        "gjc", "-p", "--no-title", "--session-dir",
+        str(proc.lane_state_path(root, Path(SESSION_RELPATH).name)),
+    ]
     if not first:
         command.append("--continue")
     return [*command, f"@{plan}", IMPLEMENT_INSTRUCTION]
@@ -136,7 +140,16 @@ def implement_command(root: Path, plan: Path, *, first: bool, session: str | Non
 def implement(root: Path, plan: Path, *, first: bool, session: str | None = None) -> str:
     command = implement_command(root, plan, first=first, session=session)
     try:
-        result = proc.run(command, cwd=root, timeout=IMPLEMENT_TIMEOUT_SECONDS)
+        with _private_child_environment(root) as environment:
+            state = proc.lane_state_path(root, Path(SESSION_RELPATH).name).parent
+            sandboxed = proc.sandbox_command(
+                command,
+                root,
+                Path(environment["HOME"]),
+                state,
+            )
+            result = proc.run(sandboxed, cwd=root, env=environment,
+                              timeout=IMPLEMENT_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired as error:
         raise DriveError(
             f"gjc did not finish within {IMPLEMENT_TIMEOUT_SECONDS}s and was killed; "
@@ -159,19 +172,31 @@ def run_gate(root: Path, gate: str, *, env: Mapping[str, str] | None = None,
     still recognisable as a live secret is redacted before it can travel.
     """
     environment = dict(env) if env is not None else proc.sanitized_env()
-    try:
-        result = proc.run_tail(gate, cwd=root, shell=True, env=environment,
-                              limit=GATE_LOG_LIMIT, timeout=timeout)
-    except subprocess.TimeoutExpired as error:
-        # A gate that hangs holds the drive lock, and that lock is what stops two
-        # drives from executing each other's plans in one worktree.
-        raise DriveError(
-            f"gate did not finish within {timeout:.0f}s and was killed; "
-            "no verdict was produced"
-        ) from error
-    except (OSError, subprocess.SubprocessError) as error:
-        raise DriveError(f"gate could not run: {error}") from error
-    redacted, _ = redact_secrets(result.output)
+    command, _ = gate_command(root, gate)
+    with tempfile.TemporaryDirectory(prefix="lane-gate-") as private:
+        if Path(command[0]).name == "uv" and len(command) > 1 and command[1] == "run":
+            command = [command[0], "run", "--isolated", "--locked", *command[2:]]
+            environment["UV_CACHE_DIR"] = "/mnt/sol-lane/home/uv-cache"
+        sandboxed = proc.sandbox_command(
+            command,
+            root,
+            Path(private) / "home",
+            Path(private) / "state",
+            writable_paths=(),
+        )
+        try:
+            result = proc.run_tail(sandboxed, cwd=root, env=environment,
+                                   limit=GATE_LOG_LIMIT, timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            # A gate that hangs holds the drive lock, and that lock is what stops two
+            # drives from executing each other's plans in one worktree.
+            raise DriveError(
+                f"gate did not finish within {timeout:.0f}s and was killed; "
+                "no verdict was produced"
+            ) from error
+        except (OSError, subprocess.SubprocessError) as error:
+            raise DriveError(f"gate could not run: {error}") from error
+    redacted, _ = redact_secrets(result.output, environment)
     return result.returncode == 0, redacted
 
 
@@ -208,7 +233,8 @@ def gate_digests(root: Path, gate: str, globs: Sequence[str]) -> dict[str, str]:
     # .venv keeps generated noise out of the protected globs; applied here it
     # would exempt `.venv/bin/pytest` from the freeze, and a gate rewritten to
     # exit 0 passes both integrity checks. (Sol Pro, reviewing this file.)
-    for name in _gate_command_files(root, gate):
+    _, dependencies = gate_command(root, gate)
+    for name in dependencies:
         path = root / name
         if path.is_file():
             digests[name] = _file_digest(path)
@@ -223,25 +249,86 @@ def _file_digest(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _gate_command_files(root: Path, gate: str) -> list[str]:
-    """Tokens of the gate command that name a file inside the repository.
+def gate_command(root: Path, gate: str) -> tuple[list[str], tuple[str, ...]]:
+    """Parse a deterministic gate argv and identify its repository files.
 
-    `./scripts/gate.sh` is as much the verification as the tests it runs, and no
-    glob list will know its name.
+    Shell syntax is never interpreted. A path-like command or argument must
+    resolve below *root*, so a gate script has a stable, freezeable identity.
+    Nonexistent path-like arguments are retained as dependencies: creating one
+    after the pre-flight gate is not evidence of a repair.
     """
     try:
         tokens = shlex.split(gate)
-    except ValueError:
-        return []
-    files = []
-    for token in tokens:
-        if not token or token.startswith(("-", "/")):
+    except ValueError as error:
+        raise DriveError(f"invalid gate argv: {error}") from error
+    if not tokens:
+        raise DriveError("gate argv must not be empty")
+
+    base = root.resolve()
+    files: set[str] = set()
+    for index, token in enumerate(tokens):
+        if not token or token.startswith("-"):
             continue
-        relative = Path(token)
-        if ".." in relative.parts or not (root / relative).is_file():
+        candidate = Path(token)
+        if candidate.is_absolute():
+            if index == 0 and (not candidate.is_file() or not os.access(candidate, os.X_OK)):
+                raise DriveError(f"gate executable is not runnable: {token}")
             continue
-        files.append(relative.as_posix())
-    return files
+        local = (
+            "/" in token
+            or token.startswith(".")
+            or (base / candidate).is_file()
+        )
+        if not local:
+            continue
+        raw_path = candidate if candidate.is_absolute() else base / candidate
+        if raw_path.is_symlink():
+            raise DriveError(f"gate path must not be a symlink: {token}")
+        try:
+            relative = raw_path.resolve(strict=False).relative_to(base)
+        except ValueError as error:
+            raise DriveError(f"gate path escapes the repository: {token}") from error
+        if relative == Path("."):
+            raise DriveError("gate path must name a file")
+        files.add(relative.as_posix())
+        if index == 0:
+            script = base / relative
+            if not script.is_file() or script.is_symlink():
+                raise DriveError(f"repository gate script is not a regular file: {relative}")
+            if not os.access(script, os.X_OK):
+                raise DriveError(f"repository gate script is not executable: {relative}")
+    return tokens, tuple(sorted(files))
+
+
+def _gate_command_files(root: Path, gate: str) -> list[str]:
+    """Compatibility-free internal view used by integrity checks."""
+    return list(gate_command(root, gate)[1])
+
+
+@contextmanager
+def _private_child_environment(root: Path):
+    """Provide private child state; this is not an OS sandbox.
+
+    The implementer must edit the worktree, so environment cleanup cannot
+    confine it. In particular, targeting an operator-owned SDK session is
+    rejected above rather than being misrepresented as sandboxed execution.
+    """
+    with tempfile.TemporaryDirectory(prefix="sol-lane-child-") as home:
+        private = Path(home)
+        state = {
+            "HOME": str(private),
+            "TMPDIR": str(private / "tmp"),
+            "XDG_CACHE_HOME": str(private / "cache"),
+            "XDG_CONFIG_HOME": str(private / "config"),
+            "XDG_DATA_HOME": str(private / "data"),
+            "XDG_RUNTIME_DIR": str(private / "runtime"),
+            "XDG_STATE_HOME": str(private / "state"),
+        }
+        for location in state.values():
+            Path(location).mkdir(exist_ok=True)
+        environment = proc.sanitized_env()
+        environment.update(state)
+        yield environment
 
 
 def gate_tampering(before: Mapping[str, str], after: Mapping[str, str], *,

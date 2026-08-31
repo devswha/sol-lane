@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import os
+import shutil
+import stat
+import tempfile
 import tomllib
 from collections.abc import Mapping
+from contextlib import contextmanager
 from fnmatch import fnmatch
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +39,9 @@ DEFAULT_GATE_PROTECTED = [
     # `uv run pytest` resolves the interpreter and the dependency set from these,
     # so they decide what the gate actually executes.
     "uv.lock", "uv.toml", ".python-version",
+    # In sol-lane itself this is the browser-driving executable used between
+    # iterations; an implementer must not replace it before the next plan.
+    "vendor/pack_and_ask.py",
 ]
 
 
@@ -159,7 +167,15 @@ def unsafe_pack_paths(root: Path, globs: tuple[str, ...]) -> list[str]:
     problems: set[str] = set()
     for pattern in globs:
         for path in root.glob(pattern):
-            if not path.is_file():
+            try:
+                mode = path.lstat().st_mode
+            except OSError:
+                continue
+            if stat.S_ISLNK(mode):
+                relative = path.relative_to(root)
+                problems.add(f"{relative}: symlinked")
+                continue
+            if not stat.S_ISREG(mode):
                 continue
             relative = path.relative_to(root)
             if _has_symlink_component(root, relative):
@@ -168,6 +184,17 @@ def unsafe_pack_paths(root: Path, globs: tuple[str, ...]) -> list[str]:
             if not path.resolve().is_relative_to(resolved_root):
                 problems.add(f"{relative}: resolves outside the root")
                 continue
+            try:
+                descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            except OSError:
+                problems.add(f"{relative}: changed while validating")
+                continue
+            try:
+                if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                    problems.add(f"{relative}: not a regular file")
+                    continue
+            finally:
+                os.close(descriptor)
             posix = relative.as_posix().lower()
             if any(posix.startswith(prefix) for prefix in SECRET_DIR_PREFIXES):
                 problems.add(f"{relative}: private artifact")
@@ -195,6 +222,46 @@ def assert_safe_pack(project: Project, root: Path, globs: tuple[str, ...]) -> No
         )
 
 
+@contextmanager
+def safe_pack_snapshot(project: Project, root: Path, globs: tuple[str, ...]):
+    """Yield a private immutable-by-name copy of the files approved for egress."""
+    assert_safe_pack(project, root, globs)
+    copied: set[Path] = set()
+    with tempfile.TemporaryDirectory(prefix="lane-pack-") as temporary:
+        snapshot = Path(temporary)
+        for pattern in globs:
+            for path in root.glob(pattern):
+                try:
+                    relative = path.relative_to(root)
+                    mode = path.lstat().st_mode
+                except (OSError, ValueError) as error:
+                    raise ConfigError(f"pack input changed while staging: {path}: {error}") from error
+                if relative in copied or not stat.S_ISREG(mode):
+                    continue
+                if (_has_symlink_component(root, relative)
+                        or any(_matches_secret_name(part) for part in relative.parts)
+                        or any(relative.as_posix().lower().startswith(prefix)
+                               for prefix in SECRET_DIR_PREFIXES)):
+                    raise ConfigError(f"pack input became unsafe while staging: {relative}")
+                try:
+                    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+                except OSError as error:
+                    raise ConfigError(f"pack input changed while staging: {relative}: {error}") from error
+                try:
+                    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                        raise ConfigError(f"pack input is not a regular file: {relative}")
+                    destination = snapshot / relative
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    with os.fdopen(descriptor, "rb") as source, destination.open("xb") as target:
+                        descriptor = None
+                        shutil.copyfileobj(source, target)
+                finally:
+                    if descriptor is not None:
+                        os.close(descriptor)
+                copied.add(relative)
+        yield snapshot
+
+
 def load(path: Path) -> Config:
     try:
         raw = tomllib.loads(path.read_text(encoding="utf-8"))
@@ -219,11 +286,11 @@ def load(path: Path) -> Config:
 
     projects = {}
     for name, table in project_tables.items():
-        projects[name] = _project(name, table, defaults)
+        projects[name] = _project(name, table, defaults, path.parent)
     return Config(path=path, defaults=defaults, projects=projects)
 
 
-def _project(name: str, table: object, defaults: dict[str, object]) -> Project:
+def _project(name: str, table: object, defaults: dict[str, object], config_dir: Path) -> Project:
     if not isinstance(table, dict):
         raise ConfigError(f"[projects.{name}] must be a table")
     unknown = set(table) - {"root", "include", "gate", *_DEFAULTS}
@@ -234,6 +301,9 @@ def _project(name: str, table: object, defaults: dict[str, object]) -> Project:
     if not isinstance(root_value, str) or not root_value.strip():
         raise ConfigError(f"[projects.{name}] requires a root path")
     root = Path(root_value).expanduser()
+    if not root.is_absolute():
+        root = config_dir / root
+    root = root.resolve()
 
     include = table.get("include", [])
     if not isinstance(include, list) or not include or not all(isinstance(item, str) and item for item in include):

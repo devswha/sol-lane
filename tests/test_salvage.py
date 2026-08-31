@@ -60,6 +60,27 @@ def test_a_non_conversation_url_is_refused():
         salvage_module.conversation_id("https://chatgpt.com/")
 
 
+@pytest.mark.parametrize("url", (
+    "http://chatgpt.com/c/0c3d4e5f-6078-89ab-cdef-234567890abc",
+    "https://evil.example/c/0c3d4e5f-6078-89ab-cdef-234567890abc",
+    "https://chatgpt.com.evil.example/c/0c3d4e5f-6078-89ab-cdef-234567890abc",
+    "https://user:pass@chatgpt.com/c/0c3d4e5f-6078-89ab-cdef-234567890abc",
+    "https://chatgpt.com/c/0c3d4e5f-6078-89ab-cdef-234567890abc?share=1",
+    "https://chatgpt.com/c/0c3d4e5f-6078-89ab-cdef-234567890abc#turn",
+    "https://chatgpt.com/c/not-a-uuid",
+    "https://chatgpt.com/c/0c3d4e5f-6078-89ab-cdef-234567890abc/extra",
+))
+def test_only_canonical_allowed_chatgpt_conversation_urls_are_accepted(url: str):
+    with pytest.raises(salvage_module.SalvageError, match="not a conversation URL"):
+        salvage_module.conversation_id(url)
+
+
+def test_the_legacy_chatgpt_origin_is_accepted():
+    assert salvage_module.conversation_id(
+        "https://chat.openai.com/c/0c3d4e5f-6078-89ab-cdef-234567890abc"
+    ) == "0c3d4e5f-6078-89ab-cdef-234567890abc"
+
+
 def test_find_page_matches_on_the_conversation_id():
     wanted = FakePage(URL + "?model=gpt")
     pages = [FakePage("https://chatgpt.com/c/aaaaaaaa-1111-2222-3333-444444444444"), wanted]
@@ -180,6 +201,19 @@ def test_a_salvage_never_writes_through_a_symlink(tmp_path: Path):
     assert victim.read_text(encoding="utf-8") == "the verified answer"
     assert not result.path.is_symlink()
     assert "unverified text" in result.path.read_text(encoding="utf-8")
+
+
+def test_salvage_refuses_a_symlinked_output_directory(tmp_path: Path):
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    output = tmp_path / "output"
+    output.symlink_to(victim, target_is_directory=True)
+    reading = salvage_module.Reading(body="unverified text", assistant_turns=0, streaming=False)
+
+    with pytest.raises(salvage_module.SalvageError, match="unsafe salvage directory"):
+        salvage_module.write(URL, reading, output)
+
+    assert list(victim.iterdir()) == []
 
 
 def test_two_salvages_in_the_same_second_are_two_files(tmp_path: Path):

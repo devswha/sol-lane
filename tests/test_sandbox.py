@@ -78,12 +78,14 @@ tag = f"{int(time.time())}_{os.getpid()}"
 
 
 def write_response(body):
-    out = os.path.join(os.getcwd(), ".insane-review")
+    out = os.environ.get("INSANE_REVIEW_OUT", os.path.join(os.getcwd(), ".insane-review"))
     os.makedirs(out, exist_ok=True)
-    with open(os.path.join(out, f"response_sandbox_{tag}.md"), "w", encoding="utf-8") as f:
+    response = os.path.join(out, f"response_sandbox_{tag}.md")
+    with open(response, "w", encoding="utf-8") as f:
         f.write("# review\\n- 모델: GPT-5.6\\n\\n---\\n" + body + "\\n")
     with open(os.path.join(out, f"manifest_sandbox_{tag}.json"), "w", encoding="utf-8") as f:
         f.write('{"chat_url": "https://chatgpt.com/c/5a5a5a5a-0000-4000-8000-%012d"}' % os.getpid())
+    print(f"[완료] 응답 저장: {response}")
 
 
 REFUSAL = "이 콘텐츠는 표시할 수 없습니다 (Trusted Access)"
@@ -300,13 +302,11 @@ def test_a_failed_review_leaves_evidence_the_repairer_can_read(
 
 
 def test_repair_hands_the_evidence_to_a_real_repairer_process(
-        write_config, stub_engine, tmp_path: Path, project_root: Path, monkeypatch, capsys):
+        write_config, stub_engine, online, tmp_path: Path, project_root: Path, monkeypatch, capsys):
     config = write_config()
-    manifests = project_root / ".insane-review"
-    manifests.mkdir()
-    (manifests / "failed_20260827_150000_deadbeef.log").write_text(
-        "# failed review run 20260827_150000_deadbeef\n# exit 1, reason: no verified response\n"
-        "❌ 컴포저를 찾을 수 없음 (composer selector matched nothing)\n", encoding="utf-8")
+    assert cli.main([
+        "--config", str(config), "review", "demo", "please DIE quietly",
+    ]) == cli.EXIT_DELIVERY
     fake_gjc(tmp_path, monkeypatch, REPAIRING_GJC)
 
     assert cli.main(["--config", str(config), "repair"]) == cli.EXIT_OK

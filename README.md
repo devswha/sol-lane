@@ -23,6 +23,8 @@ lane review/drive/serve ──▶ vendor/pack_and_ask.py (CDP) ──▶ ChatGPT
 
 - **Linux** (프로세스 간 락이 abstract socket이라 다른 OS에선 동작하지 않는다)
 - **[uv](https://docs.astral.sh/uv/)** 와 Python 3.11+
+- **bubblewrap (`bwrap`)** — `lane drive`와 `lane repair`의 구현자를 호스트 홈과
+  별도 PID/IPC namespace로 격리한다. 없으면 두 명령은 fail-closed로 중단한다.
 - **ChatGPT Pro 구독으로 로그인된 Chrome/Chromium**, CDP 디버그 포트 `9222`.
   없으면 `lane review`/`lane serve`가 엔진의 `--ensure-env`로 전용 프로필을
   띄워보고, 그래도 안 되면 멈춘다(첫 실행은 그 프로필에서 손으로 로그인해야 한다).
@@ -33,7 +35,7 @@ lane review/drive/serve ──▶ vendor/pack_and_ask.py (CDP) ──▶ ChatGPT
 
 ```bash
 git clone https://github.com/devswha/sol-lane.git && cd sol-lane
-uv sync --extra dev
+uv sync --locked --extra dev
 cp lane.toml.example lane.toml   # 자기 프로젝트의 root·include로 고쳐라
 uv run lane doctor               # engine·browser 전부 ok면 준비 끝
 ```
@@ -294,8 +296,28 @@ lane repair --evidence <log> --dry-run   # 브리프만 확인
 ## 테스트
 
 ```bash
-uv run pytest -q        # 단위 + 샌드박스 전부 — Pro 메시지 0통, 브라우저 불필요
+uv lock --check
+uv sync --locked --extra dev
+uv run --locked ruff check .
+uv run --locked bandit --config pyproject.toml --quiet --recursive src -ll
+uv export --locked --no-dev --no-editable --no-emit-project --format requirements-txt --output-file requirements.txt
+uv run --locked pip-audit --strict --requirement requirements.txt
+uv run --locked pytest --cov=lane
+uv build
+uv run --locked twine check dist/*
+uv venv --clear .smoke-venv
+uv pip install --python .smoke-venv/bin/python --requirement requirements.txt
+uv pip install --python .smoke-venv/bin/python --no-deps dist/*.whl
+.smoke-venv/bin/lane --help
 ```
+
+CI는 Ubuntu에서 Python 3.11부터 현재 안정 버전(3.14)까지 이 순서를 강제한다.
+워크플로 권한은 저장소 읽기 전용이며, Dependabot은 GitHub Actions와 Python 의존성을
+매주 점검한다.
+
+배포 정책은 **소스 체크아웃 설치만 지원**이다. CI가 wheel 재현성과 설치 가능성은
+검증하지만, 현재 태그나 PyPI를 공식 배포 채널로 취급하지 않으며 자동 게시 자격증명도
+두지 않는다.
 
 `tests/test_sandbox.py`는 프로세스 경계를 실물로 건넌다: 스텁 엔진 서브프로세스
 (`LANE_ENGINE` 봉합선), 실제 HTTP 소켓의 serve, PATH의 가짜 `gjc` 실행파일, 실제
@@ -321,4 +343,6 @@ uv run pytest -q        # 단위 + 샌드박스 전부 — Pro 메시지 0통, �
    조각(`--continue-chat`, `lane followup`)은 있고 serve 결선만 남았다.
 8. 선별·구조화 강화 — 파일 집합 자동 확정, 계획 스키마 검증.
 9. ~~omg export — `lane engine export <경로>`: 바이트 정확 복사 + provenance
-   사이드카(sha256·커밋·시각)로 oh-my-gajae-code 등 소비자에게 공급한다.~~
+   사이드카(sha256·커밋·시각)로 oh-my-gajae-code 등 소비자에게 공급한다.
+   소비자는 사이드카가 존재하고 artifact 이름·sha256이 일치할 때만 게시된 쌍으로
+   받아들인다.~~

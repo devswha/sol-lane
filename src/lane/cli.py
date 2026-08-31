@@ -93,8 +93,12 @@ def build_parser() -> argparse.ArgumentParser:
     engine_export = engine_sub.add_parser(
         "export", help="copy the committed engine to a consumer checkout with provenance")
     engine_export.add_argument("destination", help="path the engine copy is written to")
-    serve = sub.add_parser("serve", help="expose Sol Pro as a local OpenAI-compatible endpoint")
-    serve.add_argument("--host", default="127.0.0.1")
+    serve = sub.add_parser(
+        "serve",
+        help="expose Sol Pro on loopback; put TLS/authentication at a reverse proxy for remote access",
+    )
+    serve.add_argument("--host", default="127.0.0.1",
+                       help="loopback bind address only (default: 127.0.0.1)")
     serve.add_argument("--port", type=int, default=8799)
     serve.add_argument("--max-wait", type=int, help="override the configured max_wait")
     serve.add_argument("--force-answer-after", type=int, help="override the configured force_answer_after")
@@ -237,16 +241,13 @@ def _engine_export(config: Config, args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
-
-
 def _serve(config: Config, args: argparse.Namespace) -> int:
     engine_path = _engine(config)
     token = os.environ.get("SOL_PRO_LOCAL_KEY", "").strip() or None
-    if token is None and args.host not in LOOPBACK_HOSTS:
+    if not serve_module.is_loopback_host(args.host):
         raise ConfigError(
-            f"refusing to bind {args.host} without SOL_PRO_LOCAL_KEY: every request "
-            "spends a subscription message"
+            f"refusing plaintext non-loopback bind {args.host}: terminate TLS and enforce "
+            "authentication at a reverse proxy, then bind lane serve to loopback"
         )
     defaults = config.defaults
     settings = serve_module.ServeSettings(

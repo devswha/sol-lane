@@ -2,20 +2,47 @@
 name = "sol-lane"
 version = "0.1.0"
 description = "Sol Pro review lane: pack, deliver, harvest — from one CLI."
+readme = "README.md"
 requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+maintainers = [{ name = "devswha" }]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+]
 dependencies = [
     "playwright>=1.44",
     "pyperclip>=1.8",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+dev = [
+    "bandit>=1.8",
+    "pip-audit>=2.9",
+    "pytest>=8",
+    "pytest-cov>=6",
+    "ruff>=0.12",
+    "twine>=6.2",
+]
 
 [project.scripts]
 lane = "lane.cli:main"
 
+[project.urls]
+Homepage = "https://github.com/devswha/sol-lane"
+Issues = "https://github.com/devswha/sol-lane/issues"
+Repository = "https://github.com/devswha/sol-lane.git"
+
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling==1.32.0"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
@@ -23,3 +50,28 @@ packages = ["src/lane"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+source = ["lane"]
+
+[tool.coverage.report]
+fail_under = 85
+show_missing = true
+skip_covered = true
+exclude_also = [
+    "if __name__ == .__main__.:",
+]
+
+[tool.ruff]
+target-version = "py311"
+extend-exclude = ["vendor"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "S101"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S101"]
+
+[tool.bandit]
+exclude_dirs = ["tests", "vendor"]

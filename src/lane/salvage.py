@@ -17,12 +17,12 @@ written here.
 from __future__ import annotations
 
 import os
-import tempfile
+import re
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
-
-from .review import CONVERSATION_RE
+from urllib.parse import urlsplit
 
 CDP_ENDPOINT = "http://127.0.0.1:9222"
 # The engine closes its page in a finally block, so by the time anyone wants a
@@ -37,6 +37,14 @@ EXPAND_LABELS = ("더 보기", "Show more")
 ASSISTANT_SELECTOR = '[data-message-author-role="assistant"]'
 STOP_BUTTON = 'button[data-testid="stop-button"]'
 EXPAND_SETTLE_SECONDS = 0.3
+ALLOWED_CONVERSATION_ORIGINS = frozenset((
+    "https://chatgpt.com",
+    "https://chat.openai.com",
+))
+CONVERSATION_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
 
 
 class SalvageError(Exception):
@@ -60,17 +68,42 @@ class Salvaged:
 
 def conversation_id(url: str) -> str:
     """The `/c/<id>` part, which identifies a page across reloads and titles."""
-    match = CONVERSATION_RE.search(url)
-    if match is None:
+    try:
+        parsed = urlsplit(url)
+    except ValueError as error:
+        raise SalvageError(f"not a conversation URL: {url}") from error
+    try:
+        port = parsed.port
+    except ValueError:
+        port = -1
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    parts = parsed.path.split("/")
+    if (
+        parsed.scheme != "https"
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is not None
+        or origin not in ALLOWED_CONVERSATION_ORIGINS
+        or parsed.query
+        or parsed.fragment
+        or len(parts) != 3
+        or parts[:2] != ["", "c"]
+        or not CONVERSATION_UUID_RE.fullmatch(parts[2])
+    ):
         raise SalvageError(f"not a conversation URL: {url}")
-    return match.group(0).removeprefix("/c/")
+    return parts[2].lower()
 
 
 def find_page(pages, url: str):
     """The open page showing *url*, or None when nothing has it open."""
     wanted = conversation_id(url)
     for page in pages:
-        if wanted in getattr(page, "url", ""):
+        try:
+            page_url = urlsplit(getattr(page, "url", ""))
+            page_id = conversation_id(page_url._replace(query="", fragment="").geturl())
+        except (SalvageError, ValueError):
+            continue
+        if page_id == wanted:
             return page
     return None
 
@@ -132,16 +165,42 @@ def write(url: str, reading: Reading, out_dir: Path) -> Salvaged:
     """
     if not reading.body.strip():
         raise SalvageError(f"conversation {conversation_id(url)} holds no readable text")
+    conversation_id(url)
     out_dir.mkdir(parents=True, exist_ok=True)
-    stamp = time.strftime("%Y%m%d_%H%M%S")
-    descriptor, name = tempfile.mkstemp(dir=out_dir, prefix=f"salvaged_{stamp}_", suffix=".md")
-    path = Path(name)
     try:
+        directory = os.open(out_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as error:
+        raise SalvageError(f"unsafe salvage directory {out_dir}: {error}") from error
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    descriptor = None
+    path = None
+    try:
+        for _ in range(100):
+            name = f"salvaged_{stamp}_{uuid.uuid4().hex}.md"
+            try:
+                descriptor = os.open(
+                    name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=directory,
+                )
+                path = out_dir / name
+                break
+            except FileExistsError:
+                continue
+        if descriptor is None or path is None:
+            raise SalvageError("could not allocate a unique salvage file")
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
             stream.write(render(url, reading))
+        descriptor = None
     except BaseException:
-        path.unlink(missing_ok=True)
+        if descriptor is not None:
+            os.close(descriptor)
+        if path is not None:
+            path.unlink(missing_ok=True)
         raise
+    finally:
+        os.close(directory)
     return Salvaged(path=path, chars=len(reading.body.strip()),
                     assistant_turns=reading.assistant_turns, streaming=reading.streaming)
 

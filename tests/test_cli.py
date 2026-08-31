@@ -10,6 +10,7 @@ from lane import engine as engine_module
 def vendored_engine(lane_repo: Path) -> Path:
     path = engine_module.engine_path(lane_repo)
     path.write_text("x = 1\n", encoding="utf-8")
+    engine_module.ENGINE_SHA256 = engine_module.digest(path)
     return path
 
 
@@ -113,13 +114,16 @@ def test_drive_without_a_gate_is_refused(write_config, lane_repo: Path, capsys):
     assert "needs a gate command" in capsys.readouterr().err
 
 
-def test_serve_refuses_a_public_bind_without_a_token(write_config, lane_repo: Path, capsys, monkeypatch):
+def test_serve_refuses_plaintext_public_bind_even_with_a_token(
+        write_config, lane_repo: Path, capsys, monkeypatch):
     config = write_config()
     vendored_engine(lane_repo)
-    monkeypatch.delenv("SOL_PRO_LOCAL_KEY", raising=False)
+    monkeypatch.setenv("SOL_PRO_LOCAL_KEY", "secret-token")
 
     assert cli.main(["--config", str(config), "serve", "--host", "0.0.0.0"]) == cli.EXIT_CONFIG
-    assert "spends a subscription message" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "reverse proxy" in err
+    assert "loopback" in err
 
 
 def test_missing_config_is_a_config_error(tmp_path: Path, capsys):
@@ -264,10 +268,16 @@ def test_repair_dry_run_prints_brief_and_command_without_writing(write_config, l
     vendored_engine(lane_repo)
     evidence = project_root / ".insane-review"
     evidence.mkdir(exist_ok=True)
-    (evidence / "failed_20260827_150000_abcd.log").write_text(
-        "# failed review run\n# exit 1\n❌ 컴포저를 찾을 수 없음\n", encoding="utf-8")
+    evidence_path = evidence / "failed_20260827_150000_abcdef12.log"
+    evidence_path.write_text(
+        "# failed review run 20260827_150000_abcdef12\n"
+        "# exit 1\n❌ 컴포저를 찾을 수 없음\n",
+        encoding="utf-8",
+    )
 
-    assert cli.main(["--config", str(config), "repair", "--dry-run"]) == cli.EXIT_OK
+    assert cli.main([
+        "--config", str(config), "repair", "--evidence", str(evidence_path), "--dry-run",
+    ]) == cli.EXIT_OK
     out = capsys.readouterr().out
     assert "컴포저를 찾을 수 없음" in out
     assert "vendor/pack_and_ask.py" in out
@@ -310,11 +320,16 @@ def test_review_stream_flag_reaches_the_engine_command(write_config, lane_repo: 
 
 
 def test_engine_export_copies_the_committed_engine_with_provenance(
-        write_config, lane_repo: Path, tmp_path: Path, capsys):
+        write_config, lane_repo: Path, tmp_path: Path, capsys, monkeypatch):
     import json
 
     config = write_config()
     engine = vendored_engine(lane_repo)
+    monkeypatch.setattr(
+        engine_module,
+        "_committed_blob",
+        lambda root, source: ("a" * 40, source.read_bytes()),
+    )
     destination = tmp_path / "consumer" / "pack_and_ask.py"
 
     assert cli.main(["--config", str(config), "engine", "export",
@@ -374,6 +389,12 @@ def test_adhoc_root_works_with_no_lane_toml_anywhere(lane_repo: Path, project_ro
                                                       capsys, monkeypatch, tmp_path: Path):
     """The omg entry point: a foreign cwd with no config, --root still runs."""
     vendored_engine(lane_repo)
+    real_root = Path(cli.__file__).resolve().parents[2]
+    monkeypatch.setattr(
+        engine_module,
+        "ENGINE_SHA256",
+        engine_module.digest(engine_module.engine_path(real_root)),
+    )
     empty_cwd = tmp_path / "foreign-repo"
     empty_cwd.mkdir()
     monkeypatch.chdir(empty_cwd)

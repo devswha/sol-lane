@@ -6,6 +6,7 @@ import pytest
 
 from lane import config
 from lane import drive as drive_module
+from lane import proc
 
 
 def test_first_plan_request_carries_the_intent_and_demands_citations():
@@ -31,11 +32,27 @@ def test_write_plan_creates_the_handoff_file(tmp_path: Path):
     assert path.read_text(encoding="utf-8") == "step one\n"
 
 
+def test_write_plan_replaces_a_symlink_without_touching_its_target(tmp_path: Path):
+    directory = tmp_path / ".ai-bridge"
+    directory.mkdir()
+    victim = tmp_path / "victim"
+    victim.write_text("keep", encoding="utf-8")
+    (directory / "current-plan.md").symlink_to(victim)
+
+    path = drive_module.write_plan(tmp_path, "safe")
+
+    assert not path.is_symlink()
+    assert path.read_text(encoding="utf-8") == "safe\n"
+    assert victim.read_text(encoding="utf-8") == "keep"
+
+
 def test_implement_uses_a_lane_owned_session_directory(tmp_path: Path):
     command = drive_module.implement_command(tmp_path, tmp_path / "plan.md", first=True)
 
     assert command[:2] == ["gjc", "-p"]
-    assert command[command.index("--session-dir") + 1] == str(tmp_path / drive_module.SESSION_RELPATH)
+    assert command[command.index("--session-dir") + 1] == str(
+        proc.lane_state_path(tmp_path, Path(drive_module.SESSION_RELPATH).name)
+    )
     assert "--continue" not in command, "the first attempt starts a fresh session"
 
 
@@ -66,20 +83,15 @@ def test_later_attempts_continue_the_same_session(tmp_path: Path):
 
 
 def test_an_explicit_session_id_switches_to_the_sdk_path(tmp_path: Path):
-    plan = tmp_path / "plan.md"
-    plan.write_text("do the thing", encoding="utf-8")
-
-    command = drive_module.implement_command(tmp_path, plan, first=True, session="019f-abc")
-
-    assert command[:4] == ["gjc", "sdk", "session", "send"]
-    assert command[command.index("--session") + 1] == "019f-abc"
-    assert "do the thing" in command[command.index("--text") + 1]
-    assert "--wait" in command
+    with pytest.raises(drive_module.DriveError, match="lane-owned"):
+        drive_module.implement_command(tmp_path, tmp_path / "plan.md", first=True,
+                                       session="019f-abc")
 
 
 def test_gate_exit_code_is_the_verdict(tmp_path: Path):
     passed, log = drive_module.run_gate(tmp_path, "echo ok")
-    failed, failure_log = drive_module.run_gate(tmp_path, "echo boom >&2; exit 1")
+    failed, failure_log = drive_module.run_gate(
+        tmp_path, 'python3 -c "import sys; print(\'boom\', file=sys.stderr); sys.exit(1)"')
 
     assert (passed, log) == (True, "ok")
     assert failed is False
@@ -87,7 +99,7 @@ def test_gate_exit_code_is_the_verdict(tmp_path: Path):
 
 
 def test_gate_log_is_bounded(tmp_path: Path):
-    _, log = drive_module.run_gate(tmp_path, "python3 -c \"print('x' * 20000)\"; exit 1")
+    _, log = drive_module.run_gate(tmp_path, "python3 -c \"print('x' * 20000)\"")
 
     assert len(log) == drive_module.GATE_LOG_LIMIT
 
@@ -258,11 +270,59 @@ def test_short_environment_values_are_not_redacted():
 def test_run_gate_does_not_leak_the_parent_environment(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("LANE_TEST_SECRET", "super-secret-value")
 
-    passed, log = drive_module.run_gate(tmp_path, 'echo "[$LANE_TEST_SECRET]"; exit 1')
+    passed, log = drive_module.run_gate(
+        tmp_path, 'python3 -c "import os, sys; print(\'[\' + os.getenv(\'LANE_TEST_SECRET\', \'\') + \']\'); sys.exit(1)"')
 
     assert passed is False
     assert "super-secret-value" not in log
     assert "[]" in log
+
+
+def test_gate_never_interprets_shell_metacharacters(tmp_path: Path):
+    planted = tmp_path / "planted"
+
+    passed, log = drive_module.run_gate(tmp_path, f'echo "safe; touch {planted}"')
+
+    assert passed is True
+    assert log == f"safe; touch {planted}"
+    assert not planted.exists()
+
+
+def test_gate_redacts_secrets_from_its_exact_custom_environment(tmp_path: Path):
+    secret = "custom-gate-secret"
+    passed, log = drive_module.run_gate(
+        tmp_path,
+        'python3 -c "import os, sys; print(os.environ[\'SECRET\']); sys.exit(1)"',
+        env={"PATH": "/usr/bin:/bin", "SECRET": secret},
+    )
+
+    assert passed is False
+    assert secret not in log
+    assert "<redacted:SECRET>" in log
+
+
+def test_implementer_receives_private_sanitized_environment(tmp_path: Path, monkeypatch):
+    plan = tmp_path / "plan.md"
+    plan.write_text("plan", encoding="utf-8")
+    seen = {}
+
+    def completed(command, **kwargs):
+        seen.update(kwargs)
+        return drive_module.proc.Completed(returncode=0, stdout="done", stderr="")
+
+    monkeypatch.setenv("LANE_TEST_SECRET", "parent-secret")
+    monkeypatch.setattr(
+        drive_module.proc,
+        "sandbox_command",
+        lambda command, *args, **kwargs: command,
+    )
+    monkeypatch.setattr(drive_module.proc, "run", completed)
+
+    assert drive_module.implement(tmp_path, plan, first=True) == "done"
+    environment = seen["env"]
+    assert Path(environment["HOME"]).parent == Path("/tmp")
+    assert environment["XDG_STATE_HOME"].startswith(environment["HOME"])
+    assert "LANE_TEST_SECRET" not in environment
 
 
 def make_verified_repo(root: Path) -> None:
@@ -290,6 +350,7 @@ def test_gate_digests_cover_the_verification_and_nothing_else(tmp_path: Path):
 def test_gate_digests_include_a_gate_script_no_glob_would_name(tmp_path: Path):
     script = tmp_path / "run-gate.sh"
     script.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    script.chmod(0o755)
 
     digests = drive_module.gate_digests(tmp_path, "./run-gate.sh --verbose", ())
 
@@ -449,6 +510,7 @@ def venv_gate_repo(root: Path) -> Path:
     runner = root / ".venv" / "bin" / "pytest"
     runner.parent.mkdir(parents=True)
     runner.write_text("#!/bin/sh\nexec python -m pytest \"$@\"\n", encoding="utf-8")
+    runner.chmod(0o755)
     return runner
 
 
@@ -491,17 +553,16 @@ def test_a_rewritten_gate_runner_stops_the_drive_before_the_verdict(tmp_path: Pa
 
 
 def test_a_gate_script_created_by_the_implementation_is_refused(tmp_path: Path):
-    """The pre-flight gate was red because the script was missing. Creating it is
-    writing the verdict, not earning it."""
+    """Creating a gate dependency after pre-flight writes the verdict."""
     make_verified_repo(tmp_path)
-    gate = "./scripts/gate.sh"
+    gate = "python3 ./scripts/gate.py"
     (tmp_path / "scripts").mkdir()
 
     def implementer(plan, first):
-        script = tmp_path / "scripts" / "gate.sh"
-        script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        script = tmp_path / "scripts" / "gate.py"
+        script.write_text("raise SystemExit(0)\n", encoding="utf-8")
 
-    with pytest.raises(drive_module.DriveError, match=r"scripts/gate.sh \(added"):
+    with pytest.raises(drive_module.DriveError, match=r"scripts/gate.py \(added"):
         drive_module.drive(tmp_path, "task", gate, max_iters=2,
                            planner=lambda prompt: "plan", implementer=implementer,
                            gate_runner=lambda: (False, "no such file"),

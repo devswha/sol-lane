@@ -16,6 +16,11 @@ include = ["src/**/*.py"]
 """
 
 
+@pytest.fixture(autouse=True)
+def isolated_state_home(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+
+
 @pytest.fixture
 def lane_repo(tmp_path: Path) -> Path:
     (tmp_path / "vendor").mkdir()

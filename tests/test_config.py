@@ -11,6 +11,7 @@ from lane.config import (
     checked_root,
     find_config,
     load,
+    safe_pack_snapshot,
     secret_markers_in,
     unsafe_pack_paths,
 )
@@ -25,6 +26,16 @@ def test_defaults_apply_and_project_overrides_win(write_config):
     assert project.max_wait == 1200
     assert project.model == "pro"
     assert project.no_project is True
+
+
+def test_safe_pack_snapshot_freezes_the_validated_bytes(write_config, project_root: Path):
+    project = load(write_config()).project("demo")
+    source = project_root / "src" / "app.py"
+    original = source.read_bytes()
+
+    with safe_pack_snapshot(project, project_root, project.include) as snapshot:
+        source.write_text("changed = True\n", encoding="utf-8")
+        assert (snapshot / "src" / "app.py").read_bytes() == original
 
 
 def test_unknown_project_lists_the_configured_ones(write_config):

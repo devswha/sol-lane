@@ -28,8 +28,8 @@ def post(url: str, payload: dict, *, timeout: float = 10.0):
 
 
 @contextmanager
-def running(runner, settings=SETTINGS):
-    handler = serve_module.make_handler(settings, runner=runner, log=lambda *_: None)
+def running(runner, settings=SETTINGS, *, log=lambda *_: None):
+    handler = serve_module.make_handler(settings, runner=runner, log=log)
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
@@ -145,7 +145,7 @@ def test_delivery_failure_is_502_not_an_empty_completion(server):
         post(f"{server}/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}]})
 
     assert caught.value.code == 502
-    assert "fail-closed" in json.loads(caught.value.read())["error"]["message"]
+    assert json.loads(caught.value.read())["error"]["message"] == "engine delivery failed"
 
 
 _concurrent: list[str] = []
@@ -215,7 +215,8 @@ def test_stream_failure_emits_an_error_frame_not_a_silent_stop(server):
                 for line in body.splitlines()
                 if line.startswith("data: ") and "choices" in line]
     assert "lane_delivery_error" in body
-    assert "fail-closed" in body
+    assert "engine delivery failed" in body
+    assert "fail-closed" not in body
     assert set(contents) <= {""}, "a failed delivery must not emit answer text"
 
 
@@ -260,6 +261,148 @@ def test_a_wrong_token_is_refused_on_model_listing():
         with pytest.raises(urllib.error.HTTPError) as caught:
             urllib.request.urlopen(request, timeout=10)
     assert caught.value.code == 401
+
+
+def raw_request(url: str, request: bytes, *, timeout: float = 2.0) -> bytes:
+    parsed = urllib.parse.urlparse(url)
+    with socket.create_connection((parsed.hostname, parsed.port), timeout=timeout) as connection:
+        connection.settimeout(timeout)
+        connection.sendall(request)
+        return connection.recv(4096)
+
+
+def test_unauthorized_request_is_rejected_before_oversized_body_is_read():
+    settings = dataclasses.replace(SETTINGS, token="secret-token")
+    with running(lambda s, p: "hello", settings) as url:
+        response = raw_request(
+            url,
+            b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\n"
+            b"Content-Length: 999999999\r\n\r\n",
+        )
+
+    assert response.startswith(b"HTTP/1.1 401")
+
+
+@pytest.mark.parametrize(
+    ("headers", "status"),
+    [
+        (b"", 411),
+        (b"Content-Length: -1\r\n", 400),
+        (f"Content-Length: {serve_module.MAX_CONTENT_LENGTH + 1}\r\n".encode(), 413),
+    ],
+)
+def test_content_length_admission_is_strict(headers, status):
+    with running(lambda s, p: "hello") as url:
+        response = raw_request(
+            url,
+            b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\n" + headers + b"\r\n",
+        )
+
+    assert response.startswith(f"HTTP/1.1 {status}".encode())
+
+
+def test_a_slow_body_times_out(monkeypatch):
+    monkeypatch.setattr(serve_module, "REQUEST_TIMEOUT_SECONDS", 0.05)
+    with running(lambda s, p: "hello") as url:
+        response = raw_request(
+            url,
+            b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n",
+        )
+
+    assert not response or response.startswith(b"HTTP/1.1 408")
+
+
+def test_a_trickled_body_cannot_extend_the_absolute_admission_deadline(monkeypatch):
+    monkeypatch.setattr(serve_module, "REQUEST_TIMEOUT_SECONDS", 0.12)
+    with running(lambda s, p: "hello") as url:
+        parsed = urllib.parse.urlsplit(url)
+        connection = socket.create_connection((parsed.hostname, parsed.port), timeout=1)
+        started = time.monotonic()
+        try:
+            connection.sendall(
+                b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\n"
+                b"Content-Length: 20\r\n\r\n"
+            )
+            closed = False
+            for _ in range(20):
+                time.sleep(0.03)
+                try:
+                    connection.sendall(b"x")
+                except OSError:
+                    closed = True
+                    break
+            if not closed:
+                connection.settimeout(0.2)
+                closed = connection.recv(1) == b""
+        finally:
+            connection.close()
+
+    assert closed
+    assert time.monotonic() - started < 0.8
+
+
+@pytest.mark.parametrize("payload", [
+    [],
+    {"messages": [None]},
+    {"messages": [{"role": "unknown", "content": "hi"}]},
+    {"messages": [{"role": "user", "content": {"text": "hi"}}]},
+    {"messages": [{"role": "user", "content": "hi"}], "stream": "yes"},
+])
+def test_malformed_request_shapes_are_rejected(server, payload):
+    with pytest.raises(urllib.error.HTTPError) as caught:
+        post(f"{server}/v1/chat/completions", payload)
+
+    assert caught.value.code == 400
+
+
+def test_only_documented_routes_and_methods_are_admitted(server):
+    cases = [
+        urllib.request.Request(f"{server}/v1/chat/completions"),
+        urllib.request.Request(f"{server}/v1/models", data=b"{}"),
+        urllib.request.Request(f"{server}/not-a-route"),
+    ]
+
+    for request, expected in zip(cases, (405, 405, 404), strict=True):
+        with pytest.raises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(request, timeout=10)
+        assert caught.value.code == expected
+
+
+def test_an_empty_configured_token_is_invalid():
+    with pytest.raises(ValueError, match="non-empty"):
+        dataclasses.replace(SETTINGS, token="")
+
+
+def test_handler_pool_refuses_connections_after_its_concurrency_limit():
+    entered = threading.Event()
+    release = threading.Event()
+
+    def runner(_settings, _prompt):
+        entered.set()
+        release.wait(2)
+        return "hello"
+
+    handler = serve_module.make_handler(SETTINGS, runner=runner, log=lambda *_: None)
+    httpd = serve_module.BoundedThreadingHTTPServer(("127.0.0.1", 0), handler, max_handlers=1)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    url = f"http://127.0.0.1:{httpd.server_address[1]}"
+    first = threading.Thread(target=lambda: post(
+        f"{url}/v1/chat/completions", {"messages": [{"role": "user", "content": "hold"}]}).read(),
+        daemon=True)
+    first.start()
+    try:
+        assert entered.wait(1), "the first request did not enter the handler"
+        response = raw_request(
+            url,
+            b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}",
+        )
+        assert response.startswith(b"HTTP/1.1 503")
+    finally:
+        release.set()
+        first.join(2)
+        httpd.shutdown()
+        httpd.server_close()
 
 
 def test_an_empty_tools_array_still_works(server):
@@ -424,14 +567,16 @@ def _calls_an_unoffered_tool(settings, prompt):
     return call_block('{"name": "rm_rf", "arguments": {}}')
 
 
-@pytest.mark.parametrize("server", [_calls_an_unoffered_tool], indirect=True)
-def test_a_call_to_an_unoffered_tool_is_502_not_an_answer(server):
-    with pytest.raises(urllib.error.HTTPError) as caught:
-        post(f"{server}/v1/chat/completions", {
-            "messages": [{"role": "user", "content": "hi"}], "tools": [WEATHER_TOOL]})
+def test_a_call_to_an_unoffered_tool_is_opaque_to_the_client_but_logged():
+    logs = []
+    with running(_calls_an_unoffered_tool, log=logs.append) as server:
+        with pytest.raises(urllib.error.HTTPError) as caught:
+            post(f"{server}/v1/chat/completions", {
+                "messages": [{"role": "user", "content": "hi"}], "tools": [WEATHER_TOOL]})
 
     assert caught.value.code == 502
-    assert "was not offered" in json.loads(caught.value.read())["error"]["message"]
+    assert json.loads(caught.value.read())["error"]["message"] == "engine delivery failed"
+    assert any("was not offered" in entry for entry in logs)
 
 
 def _emits_a_truncated_call(settings, prompt):
@@ -439,14 +584,16 @@ def _emits_a_truncated_call(settings, prompt):
     return f'checking\n```{tools_module.FENCE}\n{{"name": "get_weather"'
 
 
-@pytest.mark.parametrize("server", [_emits_a_truncated_call], indirect=True)
-def test_a_truncated_call_is_502_rather_than_executed(server):
-    with pytest.raises(urllib.error.HTTPError) as caught:
-        post(f"{server}/v1/chat/completions", {
-            "messages": [{"role": "user", "content": "hi"}], "tools": [WEATHER_TOOL]})
+def test_a_truncated_call_is_opaque_to_the_client_but_logged():
+    logs = []
+    with running(_emits_a_truncated_call, log=logs.append) as server:
+        with pytest.raises(urllib.error.HTTPError) as caught:
+            post(f"{server}/v1/chat/completions", {
+                "messages": [{"role": "user", "content": "hi"}], "tools": [WEATHER_TOOL]})
 
     assert caught.value.code == 502
-    assert "never closes" in json.loads(caught.value.read())["error"]["message"]
+    assert json.loads(caught.value.read())["error"]["message"] == "engine delivery failed"
+    assert any("never closes" in entry for entry in logs)
 
 
 @pytest.mark.parametrize("server", [_calls_a_tool], indirect=True)

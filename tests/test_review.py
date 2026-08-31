@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from lane import review as review_module
@@ -59,6 +61,18 @@ def test_command_runs_the_engine_with_an_interpreter(write_config, tmp_path: Pat
     assert command[:2] == ["/usr/bin/python3", str(engine)]
 
 
+def test_relative_project_root_is_anchored_to_the_config_directory(lane_repo: Path):
+    root = lane_repo / "worktree"
+    root.mkdir()
+    path = lane_repo / "lane.toml"
+    path.write_text(
+        '[projects.demo]\nroot = "worktree"\ninclude = ["src/**/*.py"]\n',
+        encoding="utf-8",
+    )
+
+    assert load(path).project("demo").root == root.resolve()
+
+
 def test_pack_bytes_counts_matched_files_once(project_root: Path):
     (project_root / "src" / "extra.py").write_text("y = 2\n", encoding="utf-8")
 
@@ -92,6 +106,36 @@ def test_cdp_up_is_false_without_a_listener():
     assert review_module.cdp_up("http://127.0.0.1:9/json/version", timeout=0.5) is False
 
 
+def test_cdp_up_accepts_only_a_successful_loopback_json_endpoint():
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = b'{"Browser": "sandbox"}'
+            self.send_response(200)
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    worker = threading.Thread(target=server.serve_forever)
+    worker.start()
+    try:
+        host, port = server.server_address
+        assert review_module.cdp_up(f"http://{host}:{port}/json/version")
+    finally:
+        server.shutdown()
+        server.server_close()
+        worker.join(timeout=2)
+
+
+def test_cdp_up_rejects_non_loopback_and_malformed_urls():
+    assert not review_module.cdp_up("file:///etc/passwd")
+    assert not review_module.cdp_up("http://example.com/json/version")
+    assert not review_module.cdp_up("http://127.0.0.1:not-a-port/json/version")
+
+
 def test_newest_new_response_ignores_pre_existing_files(project_root: Path):
     directory = project_root / ".insane-review"
     directory.mkdir()
@@ -109,6 +153,71 @@ def test_newest_new_response_is_none_when_nothing_was_written(project_root: Path
     before = review_module.responses(project_root)
 
     assert review_module.newest_new_response(project_root, before) is None
+
+
+def test_response_discovery_ignores_symlinked_forged_artifacts(project_root: Path, tmp_path: Path):
+    directory = project_root / ".insane-review"
+    directory.mkdir()
+    victim = tmp_path / "victim.md"
+    victim.write_text(saved(ANSWER), encoding="utf-8")
+    (directory / "response_forged.md").symlink_to(victim)
+
+    assert review_module.responses(project_root) == set()
+    assert review_module.newest_new_response(project_root, set()) is None
+
+
+def test_successful_run_response_must_be_the_engine_reported_new_artifact(project_root: Path):
+    directory = project_root / ".insane-review"
+    directory.mkdir()
+    forged = directory / "response_forged.md"
+    forged.write_text(saved(ANSWER), encoding="utf-8")
+    reported = directory / "response_prompt_current.md"
+    reported.write_text(saved(ANSWER), encoding="utf-8")
+    manifest = directory / "manifest_prompt_current.json"
+    manifest.write_text(
+        '{"chat_url": "https://chatgpt.com/c/0c3d4e5f-6078-89ab-cdef-234567890abc"}',
+        encoding="utf-8",
+    )
+    result = review_module.proc.Completed(
+        returncode=0,
+        stdout=f"[완료] 응답 저장: {reported}\n",
+        stderr="",
+    )
+
+    assert review_module.response_from_successful_run(project_root, set(), result, set()) == reported
+    assert review_module.response_from_successful_run(project_root, {reported}, result, set()) is None
+
+
+def test_followup_accepts_only_the_engine_reported_artifact(
+        write_config, project_root: Path, monkeypatch):
+    directory = project_root / ".insane-review"
+    directory.mkdir()
+    response = directory / "response_followup_current.md"
+    manifest = directory / "manifest_followup_current.json"
+
+    def run_engine(*args, **kwargs):
+        response.write_text(saved(ANSWER), encoding="utf-8")
+        manifest.write_text(
+            '{"chat_url": "https://chatgpt.com/c/aaaaaaaa-1111-2222-3333-444444444444"}',
+            encoding="utf-8",
+        )
+        return review_module.proc.Completed(
+            returncode=0,
+            stdout=f"[완료] 응답 저장: {response}\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(review_module.proc, "run", run_engine)
+
+    outcome = review_module.followup(
+        Path("engine.py"),
+        demo(write_config),
+        project_root,
+        "https://chatgpt.com/c/aaaaaaaa-1111-2222-3333-444444444444",
+        "next question",
+    )
+
+    assert outcome.response == response
 
 
 def test_harvest_command_sends_nothing(write_config, tmp_path: Path):
@@ -168,6 +277,21 @@ def test_a_manifest_without_a_conversation_is_refused(tmp_path: Path):
 
     assert review_module.conversation_of(path) is None
     assert review_module.conversation_of(broken) is None
+
+
+def test_conversation_manifest_must_be_regular_utf8(tmp_path: Path):
+    invalid = tmp_path / "manifest_invalid.json"
+    invalid.write_bytes(b"\xff")
+    victim = tmp_path / "manifest_real.json"
+    victim.write_text(
+        '{"chat_url": "https://chatgpt.com/c/aaaaaaaa-1111-2222-3333-444444444444"}',
+        encoding="utf-8",
+    )
+    linked = tmp_path / "manifest_linked.json"
+    linked.symlink_to(victim)
+
+    assert review_module.conversation_of(invalid) is None
+    assert review_module.conversation_of(linked) is None
 
 
 HEADER = "# sol-lane — GPT 응답\n\n- 모델: `GPT-5.6 Sol (Pro)`\n- 프롬프트: 게이트 동결에 구멍이 있나...\n"
@@ -254,6 +378,33 @@ def test_verification_leaves_a_real_answer_alone(tmp_path: Path):
 
     assert outcome.response == path
     assert (outcome.rejected, outcome.reason) == (None, None)
+
+
+def test_verification_never_accepts_a_response_after_a_nonzero_engine_exit(tmp_path: Path):
+    path = tmp_path / "response_run.md"
+    path.write_text(saved(ANSWER), encoding="utf-8")
+
+    outcome = review_module._verified(1, path, "prompt")
+
+    assert outcome.response is None
+    assert outcome.reason == "engine exited unsuccessfully"
+
+
+def test_reject_refuses_to_write_through_a_symlink(tmp_path: Path):
+    response = tmp_path / "response_run.md"
+    response.write_text(saved("bad"), encoding="utf-8")
+    victim = tmp_path / "victim.md"
+    victim.write_text("keep", encoding="utf-8")
+    (tmp_path / "rejected_run.md").symlink_to(victim)
+
+    try:
+        review_module.reject(response, "bad response")
+    except review_module.ReviewError:
+        pass
+    else:
+        raise AssertionError("a pre-existing rejection symlink must be refused")
+
+    assert victim.read_text(encoding="utf-8") == "keep"
 
 
 def test_only_a_real_engine_header_is_stripped():

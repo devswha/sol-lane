@@ -19,16 +19,17 @@ from __future__ import annotations
 
 import hashlib
 import json
-import shutil
+import os
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .config import ConfigError
+from . import proc
 
 VENDOR_DIR = "vendor"
 ENGINE_NAME = "pack_and_ask.py"
 OVERRIDE_ENV = "LANE_ENGINE"
+ENGINE_SHA256 = "b3de28beb0f2b70ceccdf60ff0726805e35492533393894f2e667088e8abc7d8"
 
 
 class EngineError(Exception):
@@ -65,6 +66,7 @@ def resolve(repo_root: Path, *, override: str | None = None) -> Path:
             "restore it with `git checkout -- vendor/pack_and_ask.py`"
         )
     _verify_compiles(candidate)
+    _verify_committed_bytes(repo_root, candidate)
     return candidate
 
 
@@ -86,6 +88,40 @@ def _verify_compiles(path: Path) -> None:
         raise EngineError(f"engine does not compile: {error}") from error
 
 
+def _verify_committed_bytes(repo_root: Path, path: Path) -> None:
+    """Reject a dirty vendored engine when repository provenance is available."""
+    current_digest = digest(path)
+    if current_digest != ENGINE_SHA256:
+        raise EngineError(
+            "vendored engine differs from the build-pinned digest; update the engine "
+            "and its reviewed digest together"
+        )
+    git_marker = repo_root / ".git"
+    if not git_marker.exists():
+        return
+    try:
+        relative = path.resolve(strict=True).relative_to(repo_root.resolve())
+    except (OSError, ValueError) as error:
+        raise EngineError(f"vendored engine escapes the repository: {path}") from error
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "show", f"HEAD:{relative.as_posix()}"],
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+        current = path.read_bytes()
+    except (OSError, subprocess.SubprocessError) as error:
+        raise EngineError(f"could not verify committed engine bytes: {error}") from error
+    if result.returncode != 0:
+        raise EngineError("vendored engine is not present in the current commit")
+    if result.stdout != current:
+        raise EngineError(
+            "vendored engine differs from the current commit; commit it or use "
+            f"{OVERRIDE_ENV} explicitly for development"
+        )
+
+
 def export(repo_root: Path, destination: Path) -> dict[str, str]:
     """Copy the committed engine to a consumer checkout and prove what left.
 
@@ -96,17 +132,60 @@ def export(repo_root: Path, destination: Path) -> dict[str, str]:
     can always answer "which engine is this?".
     """
     source = resolve(repo_root)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(source, destination)
+    commit, content = _committed_blob(repo_root, source)
+    content_digest = hashlib.sha256(content).hexdigest()
+    if content_digest != ENGINE_SHA256:
+        raise EngineError("committed engine blob does not match the build-pinned digest")
+    sidecar = destination.with_name(destination.name + ".provenance.json")
+    _clear_publication_marker(sidecar)
+    destination = proc.atomic_write_bytes(destination.parent, destination.name, content)
     provenance = {
+        "publication_version": 1,
+        "artifact": destination.name,
         "source": "sol-lane vendor/pack_and_ask.py",
-        "sha256": digest(source),
-        "source_commit": _git_commit(repo_root),
+        "sha256": content_digest,
+        "source_commit": commit,
         "exported_at": datetime.now(timezone.utc).isoformat(),
     }
-    sidecar = destination.with_name(destination.name + ".provenance.json")
-    sidecar.write_text(json.dumps(provenance, indent=2) + "\n", encoding="utf-8")
+    proc.atomic_write_text(
+        sidecar.parent,
+        sidecar.name,
+        json.dumps(provenance, indent=2) + "\n",
+    )
     return provenance
+
+
+def _clear_publication_marker(sidecar: Path) -> None:
+    """Remove the commit marker before replacing bytes; absence means unpublished."""
+    sidecar.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    directory_fd = os.open(sidecar.parent, flags)
+    try:
+        try:
+            os.unlink(sidecar.name, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+    finally:
+        os.close(directory_fd)
+
+
+def _committed_blob(repo_root: Path, source: Path) -> tuple[str, bytes]:
+    commit = _git_commit(repo_root)
+    if commit.startswith("unknown"):
+        raise EngineError("cannot export engine without committed Git provenance")
+    try:
+        relative = source.resolve(strict=True).relative_to(repo_root.resolve()).as_posix()
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "show", f"{commit}:{relative}"],
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        raise EngineError(f"could not read committed engine blob: {error}") from error
+    if result.returncode != 0:
+        raise EngineError("could not read committed engine blob")
+    return commit, result.stdout
 
 
 def digest(path: Path) -> str:

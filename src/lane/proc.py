@@ -11,20 +11,228 @@ signalled.
 
 from __future__ import annotations
 
+import codecs
+import hashlib
+import locale
 import os
+import queue
 import selectors
 import signal
+import shutil
+import shlex
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from secrets import token_hex
 
 TERMINATE_GRACE_SECONDS = 10.0
 # Read size for the tail path. Peak memory there is this plus twice the kept tail.
 READ_CHUNK_BYTES = 65536
 # Widest UTF-8 encoding of one character: how many bytes a kept character costs.
 BYTES_PER_CHAR = 4
+# Maximum text retained from each captured stream.  Output beyond this is
+# represented by TRUNCATION_NOTICE followed by the most recent output.
+MAX_OUTPUT_CHARS = 1_000_000
+TRUNCATION_NOTICE = "\n[output truncated]\n"
+SANDBOX_TMP = str(Path(os.sep) / "tmp")
+
+
+def lane_state_path(root: Path, name: str) -> Path:
+    """Return checkout-specific trusted state outside the mutable checkout."""
+    if Path(name).name != name:
+        raise ValueError("state name must be a basename")
+    base = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
+    identity = hashlib.sha256(str(root.resolve()).encode()).hexdigest()[:16]
+    return base / "sol-lane" / identity / name
+
+
+def trusted_state_path(root: Path, name: str) -> Path:
+    """Return parent-only orchestration state that is never mounted into sandboxes."""
+    if Path(name).name != name:
+        raise ValueError("state name must be a basename")
+    base = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
+    identity = hashlib.sha256(str(root.resolve()).encode()).hexdigest()[:16]
+    return base / "sol-lane" / "trusted" / identity / name
+
+
+def sandbox_command(command: list[str], root: Path, home: Path, state: Path, *,
+                    writable_paths: tuple[str, ...] | None = None) -> list[str]:
+    """Wrap an agent command in a bubblewrap filesystem/process boundary."""
+    sandbox_root = Path("/mnt/sol-lane/workspace")
+    sandbox_state = Path("/mnt/sol-lane/state")
+    bubblewrap = shutil.which("bwrap")
+    executable = shutil.which(command[0])
+    if bubblewrap is None or executable is None:
+        raise OSError("secure agent execution requires bubblewrap and a resolvable executable")
+    root = root.resolve(strict=True)
+    home.mkdir(parents=True, mode=0o700, exist_ok=True)
+    state.mkdir(parents=True, mode=0o700, exist_ok=True)
+    for directory in (home, state):
+        if directory.is_symlink() or not directory.is_dir():
+            raise OSError(f"unsafe sandbox directory: {directory}")
+
+    interpreter: str | None = None
+    interpreter_args: list[str] = []
+    try:
+        first_line = Path(executable).read_bytes().splitlines()[0].decode("utf-8")
+    except (OSError, UnicodeDecodeError, IndexError):
+        first_line = ""
+    if first_line.startswith("#!"):
+        shebang = shlex.split(first_line[2:].strip())
+        if shebang and Path(shebang[0]).name == "env" and len(shebang) > 1:
+            interpreter = shutil.which(shebang[1])
+            interpreter_args = shebang[2:]
+        elif shebang:
+            interpreter = str(Path(shebang[0]).resolve(strict=True))
+            interpreter_args = shebang[1:]
+        if interpreter is None:
+            raise OSError(f"could not resolve sandbox interpreter for {executable}")
+
+    executable_path = Path(executable).resolve(strict=True)
+    executable_prefix = executable_path.parent.parent
+    if (executable_prefix / "lib").is_dir():
+        executable_target = str(
+            Path("/mnt/sol-lane/agent-runtime") / executable_path.relative_to(executable_prefix)
+        )
+        executable_mount = [
+            "--dir", "/mnt/sol-lane/agent-runtime",
+            "--ro-bind", str(executable_prefix), "/mnt/sol-lane/agent-runtime",
+        ]
+    else:
+        executable_target = "/mnt/sol-lane/bin/agent"
+        executable_mount = ["--ro-bind", executable, executable_target]
+
+    rewritten = []
+    for argument in command[1:]:
+        prefix = "@" if argument.startswith("@") else ""
+        value = argument[1:] if prefix else argument
+        try:
+            path = Path(value)
+            if path.is_absolute() and path.is_relative_to(root):
+                value = str(sandbox_root / path.relative_to(root))
+            elif path.is_absolute() and path.is_relative_to(state):
+                value = str(sandbox_state / path.relative_to(state))
+        except (OSError, ValueError):
+            pass
+        rewritten.append(prefix + value)
+
+    wrapped = [
+        bubblewrap,
+        "--die-with-parent",
+        "--new-session",
+        "--unshare-pid",
+        "--unshare-ipc",
+        "--unshare-uts",
+        "--ro-bind", "/", "/",
+        "--proc", "/proc",
+        "--dev", "/dev",
+        "--tmpfs", "/mnt",
+        "--dir", "/mnt/sol-lane",
+        "--dir", "/mnt/sol-lane/bin",
+        *executable_mount,
+        "--dir", "/mnt/sol-lane/home",
+        "--bind", str(home), "/mnt/sol-lane/home",
+        "--dir", "/mnt/sol-lane/state",
+        "--bind", str(state), "/mnt/sol-lane/state",
+        "--dir", "/mnt/sol-lane/workspace",
+        "--tmpfs", "/home",
+        "--tmpfs", "/root",
+        "--tmpfs", "/run/user",
+        "--tmpfs", SANDBOX_TMP,
+    ]
+    if writable_paths is None:
+        wrapped += ["--bind", str(root), str(sandbox_root)]
+    else:
+        wrapped += ["--ro-bind", str(root), str(sandbox_root)]
+        for relative in writable_paths:
+            source = (root / relative).resolve(strict=True)
+            if not source.is_relative_to(root) or source.is_symlink():
+                raise OSError(f"unsafe writable sandbox path: {relative}")
+            wrapped += ["--bind", str(source), str(sandbox_root / relative)]
+    wrapped += [
+        "--chdir", str(sandbox_root),
+        "--setenv", "HOME", "/mnt/sol-lane/home",
+        "--setenv", "TMPDIR", SANDBOX_TMP,
+        "--setenv", "XDG_CACHE_HOME", "/mnt/sol-lane/home/cache",
+        "--setenv", "XDG_CONFIG_HOME", "/mnt/sol-lane/home/config",
+        "--setenv", "XDG_DATA_HOME", "/mnt/sol-lane/home/data",
+        "--setenv", "XDG_RUNTIME_DIR", "/mnt/sol-lane/home/runtime",
+        "--setenv", "XDG_STATE_HOME", "/mnt/sol-lane/home/state",
+        "--",
+    ]
+    if interpreter is not None:
+        insertion = wrapped.index(executable_mount[-1]) + 1
+        interpreter_path = Path(interpreter)
+        prefix = interpreter_path.parent.parent
+        if (prefix / "lib").is_dir():
+            interpreter_target = str(Path("/mnt/sol-lane/python") / interpreter_path.relative_to(prefix))
+            wrapped[insertion:insertion] = [
+                "--dir", "/mnt/sol-lane/python",
+                "--ro-bind", str(prefix), "/mnt/sol-lane/python",
+            ]
+        else:
+            interpreter_target = "/mnt/sol-lane/bin/interpreter"
+            wrapped[insertion:insertion] = [
+                "--ro-bind", interpreter, interpreter_target,
+            ]
+        wrapped += [
+            interpreter_target,
+            *interpreter_args,
+            executable_target,
+            *rewritten,
+        ]
+    else:
+        wrapped += [executable_target, *rewritten]
+    return wrapped
+
+
+def atomic_write_bytes(directory: Path, name: str, data: bytes, *, mode: int = 0o600) -> Path:
+    """Atomically replace *name* beneath a real directory without following links."""
+    if Path(name).name != name:
+        raise ValueError("atomic write name must be a basename")
+    directory.mkdir(parents=True, exist_ok=True)
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        directory_fd = os.open(directory, flags)
+    except OSError as error:
+        raise OSError(f"unsafe output directory {directory}: {error}") from error
+    temporary = f".{name}.{token_hex(8)}.tmp"
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            mode,
+            dir_fd=directory_fd,
+        )
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = None
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(
+            temporary,
+            name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        os.fsync(directory_fd)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+        os.close(directory_fd)
+    return directory / name
+
+
+def atomic_write_text(directory: Path, name: str, text: str, *, mode: int = 0o600) -> Path:
+    return atomic_write_bytes(directory, name, text.encode("utf-8"), mode=mode)
 
 # A gate inherits nothing it was not given: its output is fed back into the next
 # Sol Pro prompt, so an inherited token can leave the machine through a stack
@@ -57,22 +265,37 @@ def sanitized_env(extra_keys: tuple[str, ...] = ()) -> dict[str, str]:
     }
 
 
-def run(command: list[str] | str, *, cwd: Path | None = None, env: dict[str, str] | None = None,
-        timeout: float | None = None, shell: bool = False, capture: bool = True) -> Completed:
-    """Run *command* to completion, terminating its process group on interruption."""
+def run(command: list[str], *, cwd: Path | None = None, env: dict[str, str] | None = None,
+        timeout: float | None = None, capture: bool = True) -> Completed:
+    """Run *command* to completion with bounded captured output.
+
+    Captured streams retain at most MAX_OUTPUT_CHARS each.  Truncated output
+    starts with TRUNCATION_NOTICE and retains the newest text.
+    """
     pipe = subprocess.PIPE if capture else None
-    with subprocess.Popen(command, cwd=cwd, env=env, shell=shell, text=True,
+    deadline = None if timeout is None else time.monotonic() + timeout
+    with subprocess.Popen(command, cwd=cwd, env=env,
                           stdout=pipe, stderr=pipe, start_new_session=True) as process:
         try:
-            stdout, stderr = process.communicate(timeout=timeout)
+            if capture:
+                stdout, stderr, stdout_cut, stderr_cut = _drain_output(
+                    process, deadline=deadline,
+                )
+                stdout = _truncate_output(_decode_output(stdout), stdout_cut)
+                stderr = _truncate_output(_decode_output(stderr), stderr_cut)
+            else:
+                process.wait(None if deadline is None else max(deadline - time.monotonic(), 0.0))
+                stdout = stderr = ""
         except BaseException:  # timeout, SIGINT, SIGTERM-turned-SystemExit
             _stop(process)
             raise
+        if _group_exists(process):
+            _stop(process)
     return Completed(returncode=process.returncode, stdout=stdout or "", stderr=stderr or "")
 
 
-def run_tail(command: list[str] | str, *, cwd: Path | None = None, env: dict[str, str] | None = None,
-             shell: bool = False, limit: int, timeout: float | None = None) -> Completed:
+def run_tail(command: list[str], *, cwd: Path | None = None, env: dict[str, str] | None = None,
+             limit: int, timeout: float | None = None) -> Completed:
     """Run *command*, keeping only the last *limit* characters it printed.
 
     run() holds the child's entire output in memory and lets the caller slice a
@@ -84,7 +307,7 @@ def run_tail(command: list[str] | str, *, cwd: Path | None = None, env: dict[str
     if limit < 1:
         raise ValueError("limit must be positive")
     deadline = None if timeout is None else time.monotonic() + timeout
-    with subprocess.Popen(command, cwd=cwd, env=env, shell=shell,
+    with subprocess.Popen(command, cwd=cwd, env=env,
                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                           start_new_session=True) as process:
         try:
@@ -95,13 +318,15 @@ def run_tail(command: list[str] | str, *, cwd: Path | None = None, env: dict[str
         except BaseException:  # timeout, SIGINT, SIGTERM-turned-SystemExit
             _stop(process)
             raise
+        if _group_exists(process):
+            _stop(process)
     text = tail.decode("utf-8", "replace").strip()
     return Completed(returncode=process.returncode, stdout=text[-limit:], stderr="")
 
 
-def run_relay(command: list[str] | str, *, cwd: Path | None = None, env: dict[str, str] | None = None,
+def run_relay(command: list[str], *, cwd: Path | None = None, env: dict[str, str] | None = None,
               timeout: float | None = None) -> Completed:
-    """Run *command*, echoing its merged output live and returning it whole.
+    """Run *command*, echoing merged output live and returning bounded output.
 
     `run(capture=False)` shows progress but keeps nothing — the operator sees
     an engine die, and the next process down the line has no evidence of why.
@@ -109,24 +334,109 @@ def run_relay(command: list[str] | str, *, cwd: Path | None = None, env: dict[st
     review takes. This is both: lines are relayed as they arrive, and the full
     merged text comes back for the caller to persist on failure.
 
-    Output is bounded by the caller dropping what it does not need; an
-    unbounded child is `run_tail`'s problem, not the review engine's.
+    Retained output is capped at MAX_OUTPUT_CHARS.  When the cap is exceeded,
+    the result starts with TRUNCATION_NOTICE and retains the newest output;
+    relaying itself remains unbounded so operators still see all progress.
     """
     deadline = None if timeout is None else time.monotonic() + timeout
-    with subprocess.Popen(command, cwd=cwd, env=env, text=True,
+    with subprocess.Popen(command, cwd=cwd, env=env,
                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                           start_new_session=True) as process:
         try:
-            chunks: list[str] = []
-            for line in process.stdout:
-                chunks.append(line)
-                sys.stdout.write(line)
-                sys.stdout.flush()
-            process.wait(None if deadline is None else max(deadline - time.monotonic(), 0.0))
+            stdout, _, cut, _ = _drain_output(process, deadline=deadline, relay=True)
         except BaseException:  # timeout, SIGINT, SIGTERM-turned-SystemExit
             _stop(process)
             raise
-    return Completed(returncode=process.returncode, stdout="".join(chunks), stderr="")
+        if _group_exists(process):
+            _stop(process)
+    return Completed(returncode=process.returncode,
+                     stdout=_truncate_output(_decode_output(stdout), cut), stderr="")
+
+
+def _drain_output(process: subprocess.Popen, *, deadline: float | None,
+                  relay: bool = False) -> tuple[bytes, bytes, bool, bool]:
+    """Drain process pipes without allowing a quiet partial line to block."""
+    streams = ((process.stdout, "stdout"), (process.stderr, "stderr"))
+    buffers = {"stdout": bytearray(), "stderr": bytearray()}
+    cut = {"stdout": False, "stderr": False}
+    keep = MAX_OUTPUT_CHARS * BYTES_PER_CHAR
+    selector = selectors.DefaultSelector()
+    decoder = codecs.getincrementaldecoder(locale.getencoding())() if relay else None
+    relay_queue: queue.Queue[str] | None = queue.Queue(maxsize=64) if relay else None
+    relay_stop = threading.Event()
+    relay_writer = None
+    if relay_queue is not None:
+        def write_relay():
+            while not relay_stop.is_set() or not relay_queue.empty():
+                try:
+                    text = relay_queue.get(timeout=0.05)
+                except queue.Empty:
+                    continue
+                try:
+                    sys.stdout.write(text)
+                    sys.stdout.flush()
+                except (OSError, ValueError):
+                    return
+
+        relay_writer = threading.Thread(target=write_relay, daemon=True)
+        relay_writer.start()
+
+    def emit_relay(text: str) -> None:
+        if relay_queue is None or not text:
+            return
+        try:
+            relay_queue.put_nowait(text)
+        except queue.Full:
+            pass
+
+    try:
+        for stream, name in streams:
+            if stream is not None:
+                selector.register(stream, selectors.EVENT_READ, name)
+        while selector.get_map():
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                raise subprocess.TimeoutExpired(cmd=process.args, timeout=0)
+            events = selector.select(remaining)
+            if not events:
+                raise subprocess.TimeoutExpired(cmd=process.args, timeout=0)
+            for key, _ in events:
+                chunk = key.fileobj.read1(READ_CHUNK_BYTES)
+                name = key.data
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                if relay:
+                    emit_relay(decoder.decode(chunk))
+                buffer = buffers[name]
+                buffer += chunk
+                if len(buffer) > keep:
+                    del buffer[:-keep]
+                    cut[name] = True
+        process.wait(None if deadline is None else max(deadline - time.monotonic(), 0.0))
+        if decoder is not None:
+            emit_relay(decoder.decode(b"", final=True))
+    finally:
+        selector.close()
+        relay_stop.set()
+        if relay_writer is not None:
+            remaining = 1.0 if deadline is None else max(deadline - time.monotonic(), 0.0)
+            relay_writer.join(timeout=min(remaining, 1.0))
+    return bytes(buffers["stdout"]), bytes(buffers["stderr"]), cut["stdout"], cut["stderr"]
+
+
+def _truncate_output(output: str, was_cut: bool) -> str:
+    """Apply the public character limit after bounded byte collection."""
+    if not was_cut and len(output) <= MAX_OUTPUT_CHARS:
+        return output
+    if MAX_OUTPUT_CHARS <= len(TRUNCATION_NOTICE):
+        return TRUNCATION_NOTICE[:MAX_OUTPUT_CHARS]
+    return TRUNCATION_NOTICE + output[-(MAX_OUTPUT_CHARS - len(TRUNCATION_NOTICE)):]
+
+
+def _decode_output(output: bytes) -> str:
+    """Match subprocess text mode's locale-based decoding."""
+    return output.decode(locale.getencoding(), errors="replace")
 
 
 def _drain_tail(stream, *, keep: int, deadline: float | None = None) -> bytes:
@@ -160,17 +470,35 @@ def _drain_tail(stream, *, keep: int, deadline: float | None = None) -> bytes:
 
 def _stop(process: subprocess.Popen) -> None:
     _signal_group(process, signal.SIGTERM)
-    try:
-        process.wait(TERMINATE_GRACE_SECONDS)
-    except subprocess.TimeoutExpired:
+    deadline = time.monotonic() + TERMINATE_GRACE_SECONDS
+    while time.monotonic() < deadline:
+        # Reap an exited leader while continuing to inspect its original group:
+        # otherwise its zombie keeps killpg(..., 0) reporting a live group.
+        try:
+            process.wait(0)
+        except subprocess.TimeoutExpired:
+            pass
+        if not _group_exists(process):
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(0.05, remaining))
+    if _group_exists(process):
         _signal_group(process, signal.SIGKILL)
+    try:
         process.wait()
+    except ChildProcessError:
+        pass
 
 
 def _signal_group(process: subprocess.Popen, sig: int) -> None:
     """Signal the child's whole session; fall back to the child alone."""
     try:
-        os.killpg(os.getpgid(process.pid), sig)
+        # start_new_session makes the leader PID the process-group ID.  Looking
+        # up the leader's current PGID fails once it exits, while descendants in
+        # its original group can still be alive.
+        os.killpg(process.pid, sig)
         return
     except (ProcessLookupError, PermissionError, OSError):
         pass
@@ -178,6 +506,14 @@ def _signal_group(process: subprocess.Popen, sig: int) -> None:
         process.send_signal(sig)
     except ProcessLookupError:
         pass
+
+
+def _group_exists(process: subprocess.Popen) -> bool:
+    try:
+        os.killpg(process.pid, 0)
+    except (ProcessLookupError, PermissionError, OSError):
+        return False
+    return True
 
 
 def exit_on_sigterm() -> None:

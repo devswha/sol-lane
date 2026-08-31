@@ -1,4 +1,9 @@
 .venv/
+.smoke-venv/
+dist/
+.coverage
+htmlcov/
+requirements.txt
 
 # The operator's own project registry — lane.toml.example is the tracked one.
 lane.toml
