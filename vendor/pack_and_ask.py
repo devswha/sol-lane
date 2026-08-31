@@ -939,6 +939,27 @@ def copy_last_turn(page, base_copy: int = 0, expected: str | None = None) -> str
 
 
 # ---- 모델 스위처 ----
+# 2026-08-31 실측: 모델명 표기가 'GPT-5.6 Sol'에서 '5.6 Sol'로 바뀌었다 — 접두사 없는
+# 버전 숫자(\d+\.\d+)도 모델명으로 인정한다. effort 항목(즉시/중간/높음/최대/기본)에는
+# 숫자가 없으므로 구분은 유지된다.
+MODEL_NAME_RE = r"GPT|gpt|o\d|Claude|Gemini|\d+\.\d+"
+
+
+def _model_name_matches(menu_name: str, require: str) -> bool:
+    """2026-08-31 UI는 'GPT-5.6 Sol'을 '5.6 Sol'로 표시한다.
+
+    요청명과 메뉴명 양쪽에서 'GPT-'/'gpt ' 접두사를 떼고 나머지의 포함 관계로
+    비교한다: require 'GPT-5.6'은 메뉴 '5.6 Sol'과 일치한다.
+    """
+    def strip_prefix(value: str) -> str:
+        lowered = value.strip().casefold()
+        for prefix in ("gpt-", "gpt ", "gpt"):
+            if lowered.startswith(prefix):
+                return lowered[len(prefix):].strip("- ")
+        return lowered
+
+    return strip_prefix(require) in strip_prefix(menu_name) or strip_prefix(menu_name) in strip_prefix(require)
+
 MODEL_SWITCHER_SELECTORS = [
     'button.__composer-pill[aria-haspopup="menu"]',   # 실측: 모델/추론 pill
     'button[data-testid="model-switcher-dropdown-button"]',
@@ -1070,12 +1091,12 @@ def read_menu_state(page) -> dict:
         for it in page.query_selector_all('[role="menuitem"], [role="menuitemradio"], [role="option"]'):
             is_checked = it.get_attribute("aria-checked") == "true" or it.get_attribute("aria-selected") == "true"
             t = (it.inner_text() or "").strip()
-            if t and re.search(r"GPT|gpt|o\d|Claude|Gemini", t):
+            if t and re.search(MODEL_NAME_RE, t):
                 lines = [l.strip() for l in t.splitlines() if l.strip()]
                 # UI 변형 대응: '모델\nGPT-5.6 Sol'처럼 라벨 줄 + 값 줄로 오는 경우
                 # 모델 패턴이 실제로 매칭되는 줄을 이름으로 취한다.
                 name = next(
-                    (l for l in lines if re.search(r"GPT|gpt|o\d|Claude|Gemini", l)),
+                    (l for l in lines if re.search(MODEL_NAME_RE, l)),
                     lines[0] if lines else t,
                 )[:40]
                 if name not in state["models"]:
@@ -1095,7 +1116,7 @@ def read_menu_state(page) -> dict:
             state["items"].append(t)
             # 모델 서브메뉴가 펼쳐져 있으면 모델 radio(예: 'GPT-5.6 Sol')도 menuitemradio+checked로
             # 잡혀 추론단계 판정을 덮어쓴다 — 모델명 패턴은 effort 후보에서 제외.
-            if re.search(r"GPT|gpt|o\d|Claude|Gemini", t):
+            if re.search(MODEL_NAME_RE, t):
                 continue
             if it.get_attribute("aria-checked") == "true":
                 state["effort_checked"] = t
@@ -1108,7 +1129,7 @@ def read_menu_state(page) -> dict:
             for it in page.query_selector_all('[role="menuitem"]'):
                 t = (it.inner_text() or "").strip()
                 if re.search(r"추론|reasoning|effort", t, re.IGNORECASE) and not re.search(
-                    r"GPT|gpt|o\d|Claude|Gemini", t
+                    MODEL_NAME_RE, t
                 ):
                     lines = [l.strip() for l in t.splitlines() if l.strip()]
                     if len(lines) >= 2:
@@ -1124,6 +1145,9 @@ def select_model(page, want: str, require_model: str | None = None) -> tuple[boo
     require_model 지정 시 모델명(예: 'GPT-5.6')이 일치하지 않으면 False(실패) 반환.
     반환: (verified, verified_model_name)"""
     want_l = want.lower()
+    # 2026-08-31 UI: 메뉴가 열리면 composer pill이 DOM에서 사라진다 — effort 상태를
+    # 담은 pill은 메뉴를 열기 '전에' 읽어둔다.
+    pill_effort_before = _exact_effort_pill(page, want_l)
     if not _open_switcher(page):
         print("  ⚠️  모델 스위처를 못 찾음 → 기본 모델로 진행")
         return False, None
@@ -1141,7 +1165,7 @@ def select_model(page, want: str, require_model: str | None = None) -> tuple[boo
             except Exception:
                 pass
             return False, None
-        if require_model.lower() not in before["model"].lower():
+        if not _model_name_matches(before["model"], require_model):
             print(f"  ❌ 모델 불일치: 기대 '{require_model}' ≠ 메뉴 '{before['model']}' → 중단(전송 안 함)")
             try:
                 page.keyboard.press("Escape")
@@ -1158,6 +1182,13 @@ def select_model(page, want: str, require_model: str | None = None) -> tuple[boo
     if before["effort_checked"] and _effort_matches(before["effort_checked"], want_l):
         clicked = f"already:{before['effort_checked']}"
         print(f"  추론단계 이미 선택됨: {before['effort_checked']!r} (조작 생략)")
+    if not clicked:
+        # 2026-08-31 UI: effort 표시가 메뉴가 아니라 composer pill('5.6 Sol|최대')의
+        # 둘째 줄에만 있다. 메뉴 오픈 전에 읽어둔 pill이 이미 목표 단계를 가리키면
+        # 그대로 인정한다(열린 메뉴 안에서 pill은 DOM에 없다).
+        if pill_effort_before:
+            clicked = f"already-pill:{pill_effort_before}"
+            print(f"  추론단계 이미 선택됨(pill): {pill_effort_before!r} (조작 생략)")
 
     # 목록형 추론단계가 없으면 슬라이더 UI다 — 밀어서 맞추고 검증은 기존 재오픈 경로에 맡긴다.
     if not clicked and not before["items"]:
@@ -1237,7 +1268,7 @@ def select_model(page, want: str, require_model: str | None = None) -> tuple[boo
         return False, None
 
     # Pro 제안: 메뉴 재오픈하여 effort_checked 및 model_checked 상태 검증
-    already_selected = clicked.startswith("already:")
+    already_selected = clicked.startswith("already:") or clicked.startswith("already-pill:")
     if not _open_switcher(page):
         if not already_selected:
             print("  ⚠️  선택 상태 검증을 위해 메뉴 재오픈 실패")
@@ -1260,7 +1291,7 @@ def select_model(page, want: str, require_model: str | None = None) -> tuple[boo
 
     model_verified = True
     if require_model:
-        name_ok = after["model"] is not None and require_model.lower() in after["model"].lower()
+        name_ok = after["model"] is not None and _model_name_matches(after["model"], require_model)
         # 폴백(활성표시 없음)으로 잡은 모델명은 메뉴에 모델이 여러 개일 때 신뢰 불가 → fail-closed.
         # 활성표시(checked)거나 메뉴에 모델이 하나뿐이면 폴백이라도 안전(= 활성 모델).
         src_ok = (after.get("model_source") == "checked") or (len(after.get("models") or []) <= 1)
@@ -1268,7 +1299,11 @@ def select_model(page, want: str, require_model: str | None = None) -> tuple[boo
         if name_ok and not src_ok:
             print(f"  ❌ 활성 모델 확정 불가(체크표시 없음 + 메뉴에 모델 {len(after['models'])}개: {after['models']}) → fail-closed")
 
-    effort_verified = after["effort_checked"] is not None and _effort_matches(after["effort_checked"], want_l)
+    effort_verified = (
+        (after["effort_checked"] is not None and _effort_matches(after["effort_checked"], want_l))
+        or (already_selected and (pill_effort_before is not None
+                                  or _exact_effort_pill(page, want_l) is not None))
+    )
     verified = model_verified and effort_verified
 
     verified_model = after["model"] or "Unknown Model"
