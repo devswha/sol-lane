@@ -67,6 +67,11 @@ def test_implement_bounds_a_gjc_that_never_exits(tmp_path: Path, monkeypatch):
         seen["timeout"] = kwargs.get("timeout")
         raise subprocess.TimeoutExpired(cmd=command, timeout=kwargs.get("timeout"))
 
+    monkeypatch.setattr(
+        drive_module.proc,
+        "sandbox_command",
+        lambda command, *_args, **_kwargs: command,
+    )
     monkeypatch.setattr(drive_module.proc, "run", hang)
     plan = tmp_path / "plan.md"
     plan.write_text("plan", encoding="utf-8")
