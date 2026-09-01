@@ -243,8 +243,12 @@ def browser_env(env: dict[str, str] | None = None, *, socket_glob: str = X11_SOC
 
 def ensure_browser(engine: Path, *, python: str | None = None, timeout: float = 180.0) -> str:
     """Ask the engine to start the saved browser profile. Returns its STATUS line."""
-    result = proc.run([python or sys.executable, str(engine), "--ensure-env"],
-                      timeout=timeout, env=browser_env())
+    result = proc.run(
+        [python or sys.executable, str(engine), "--ensure-env"],
+        timeout=timeout,
+        env=browser_env(),
+        allow_descendants=True,
+    )
     for line in reversed((result.stdout + result.stderr).splitlines()):
         if line.startswith("STATUS "):
             return line.strip()

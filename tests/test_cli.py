@@ -3,6 +3,8 @@ from __future__ import annotations
 import builtins
 from pathlib import Path
 
+import pytest
+
 from lane import cli
 from lane import engine as engine_module
 
@@ -12,6 +14,28 @@ def vendored_engine(lane_repo: Path) -> Path:
     path.write_text("x = 1\n", encoding="utf-8")
     engine_module.ENGINE_SHA256 = engine_module.digest(path)
     return path
+
+
+def test_windows_keeps_the_pi_bridge_available(monkeypatch):
+    monkeypatch.setattr(cli.sys, "platform", "win32")
+
+    cli._require_platform("serve")
+
+
+def test_windows_refuses_the_unported_artifact_boundary(monkeypatch):
+    monkeypatch.setattr(cli.sys, "platform", "win32")
+
+    with pytest.raises(cli.ConfigError, match="Pi/GJC Sol Pro mode uses `lane serve`"):
+        cli._require_platform("review")
+
+
+@pytest.mark.parametrize("platform", ["darwin", "win32"])
+def test_non_linux_hosts_refuse_sandboxed_commands(monkeypatch, platform):
+    monkeypatch.setattr(cli.sys, "platform", platform)
+
+    with pytest.raises(cli.ConfigError, match="requires Linux and bubblewrap"):
+        cli._require_platform("drive")
+
 
 
 def test_projects_lists_configured_roots(write_config, capsys, project_root: Path):

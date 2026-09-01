@@ -29,6 +29,19 @@ EXIT_OK = 0
 EXIT_DELIVERY = 1
 EXIT_CONFIG = 2
 
+WINDOWS_COMMANDS = {"projects", "serve"}
+LINUX_ONLY_COMMANDS = {"drive", "repair"}
+
+
+def _require_platform(command: str) -> None:
+    if command in LINUX_ONLY_COMMANDS and sys.platform != "linux":
+        raise ConfigError(f"`lane {command}` requires Linux and bubblewrap")
+    if sys.platform == "win32" and command not in WINDOWS_COMMANDS:
+        raise ConfigError(
+            f"`lane {command}` is not supported on Windows; "
+            "Pi/GJC Sol Pro mode uses `lane serve`"
+        )
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="lane", description="Sol Pro review lane")
@@ -125,6 +138,7 @@ def main(argv: list[str] | None = None) -> int:
 def _dispatch(argv: list[str] | None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        _require_platform(args.command)
         config = _load_config(args.config, adhoc_ok=args.command == "review" and bool(args.root))
         if args.command == "projects":
             return _projects(config)

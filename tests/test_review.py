@@ -102,6 +102,19 @@ def test_browser_env_leaves_display_unset_without_a_socket(tmp_path: Path):
     assert "DISPLAY" not in review_module.browser_env({}, socket_glob=str(tmp_path / "X*"))
 
 
+def test_ensure_browser_explicitly_allows_the_launched_browser_to_persist(monkeypatch, tmp_path: Path):
+    options = {}
+
+    def fake_run(*args, **kwargs):
+        options.update(kwargs)
+        return review_module.proc.Completed(0, "STATUS ready\n", "")
+
+    monkeypatch.setattr(review_module.proc, "run", fake_run)
+
+    assert review_module.ensure_browser(tmp_path / "engine.py") == "STATUS ready"
+    assert options["allow_descendants"] is True
+
+
 def test_cdp_up_is_false_without_a_listener():
     assert review_module.cdp_up("http://127.0.0.1:9/json/version", timeout=0.5) is False
 

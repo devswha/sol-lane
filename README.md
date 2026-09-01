@@ -21,10 +21,13 @@ lane review/drive/serve ──▶ vendor/pack_and_ask.py (CDP) ──▶ ChatGPT
 
 ## 요구사항
 
-- **Linux** (프로세스 간 락이 abstract socket이라 다른 OS에선 동작하지 않는다)
+- **macOS, Windows, Linux** — Pi/GJC 연결 경로인 `lane serve`. 브라우저 단일 실행
+  락과 자식 프로세스 정리는 세 OS 모두 커널 수명에 결속된다.
+- **macOS, Linux** — 파일 패킹·영수증 경계를 포함하는 `lane review`·`harvest`·
+  `followup`·`salvage`.
+- **Linux + bubblewrap (`bwrap`)** — `lane drive`와 `lane repair`만 해당. 구현자를
+  호스트 홈과 별도 PID/IPC namespace로 격리하므로 다른 OS에서는 fail-closed로 중단한다.
 - **[uv](https://docs.astral.sh/uv/)** 와 Python 3.11+
-- **bubblewrap (`bwrap`)** — `lane drive`와 `lane repair`의 구현자를 호스트 홈과
-  별도 PID/IPC namespace로 격리한다. 없으면 두 명령은 fail-closed로 중단한다.
 - **ChatGPT Pro 구독으로 로그인된 Chrome/Chromium**, CDP 디버그 포트 `9222`.
   없으면 `lane review`/`lane serve`가 엔진의 `--ensure-env`로 전용 프로필을
   띄워보고, 그래도 안 되면 멈춘다(첫 실행은 그 프로필에서 손으로 로그인해야 한다).
@@ -36,8 +39,15 @@ lane review/drive/serve ──▶ vendor/pack_and_ask.py (CDP) ──▶ ChatGPT
 ```bash
 git clone https://github.com/devswha/sol-lane.git && cd sol-lane
 uv sync --locked --extra dev
-cp lane.toml.example lane.toml   # 자기 프로젝트의 root·include로 고쳐라
-uv run lane doctor               # engine·browser 전부 ok면 준비 끝
+cp lane.toml.example lane.toml
+uv run lane doctor               # macOS/Linux: engine·browser·artifact 경계 확인
+```
+
+```powershell
+git clone https://github.com/devswha/sol-lane.git; Set-Location sol-lane
+uv sync --locked --extra dev
+Copy-Item lane.toml.example lane.toml
+# Windows에서는 아래 Sol Pro 모드의 `uv run lane serve`가 engine·CDP 경계를 검증한다.
 ```
 
 ### 첫 로그인 (새 머신에서 한 번만)
@@ -193,8 +203,15 @@ lane drive myproj "<하고 싶은 일>" [--max-iters 2] [--session <sdk-session-
 ## Sol Pro 모드 — gjc 세션을 Pro로 돌리기
 
 ```bash
-uv run lane serve             # 127.0.0.1:8799 에 OpenAI 호환 엔드포인트
+# macOS / Linux — 각각 다른 터미널에서
+uv run lane serve
 SOL_PRO_LOCAL_KEY=local gjc --mpreset sol-pro
+```
+
+```powershell
+# Windows PowerShell — lane serve는 첫 번째 터미널에서 계속 실행
+uv run lane serve
+$env:SOL_PRO_LOCAL_KEY = "local"; gjc --mpreset sol-pro
 ```
 
 `~/.gjc/agent/models.yml`에 provider와 profile을 한 번 등록해두면 된다.

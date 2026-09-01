@@ -22,6 +22,10 @@ HOLDER = textwrap.dedent(
     """
 )
 
+@pytest.fixture(autouse=True)
+def isolate_kernel_locks(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv(locks.LOCK_DIR_ENV, str(tmp_path / "kernel-locks"))
+
 
 def start_holder(lock: Path, flag: Path, seconds: float) -> subprocess.Popen:
     src = str(Path(__file__).resolve().parents[1] / "src")
@@ -110,6 +114,7 @@ def test_replacing_the_lock_file_does_not_release_the_lock(tmp_path: Path):
         holder.wait(10)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows chmod does not make a directory read-only")
 def test_the_lock_works_when_the_pid_file_cannot_be_written(tmp_path: Path):
     """The record beside the lock is for humans; it is not the lock."""
     directory = tmp_path / "readonly"
@@ -127,16 +132,36 @@ def test_two_spellings_of_one_path_are_one_lock(tmp_path: Path):
     direct = tmp_path / "browser.lock"
     indirect = tmp_path / "." / "browser.lock"
 
-    assert locks.abstract_name(direct) == locks.abstract_name(indirect)
+    assert locks.lock_name(direct) == locks.lock_name(indirect)
 
 
 def test_different_paths_are_different_locks(tmp_path: Path):
-    assert locks.abstract_name(tmp_path / "a.lock") != locks.abstract_name(tmp_path / "b.lock")
+    assert locks.lock_name(tmp_path / "a.lock") != locks.lock_name(tmp_path / "b.lock")
 
 
-def test_a_long_path_still_fits_the_abstract_namespace(tmp_path: Path):
+def test_a_long_path_still_has_a_bounded_lock_name(tmp_path: Path):
     deep = tmp_path / ("x" * 90) / ("y" * 90) / "drive.lock"
 
-    name = locks.abstract_name(deep)
+    name = locks.lock_name(deep)
 
-    assert len(name) <= 108 and name.startswith(b"\0lane-")
+    assert len(name) == len("lane-") + locks.DIGEST_CHARS + len(".lock")
+
+
+def test_load_bearing_lock_is_outside_the_receipt_tree(tmp_path: Path):
+    receipt = tmp_path / "mutable-worktree" / ".ai-bridge" / "drive.lock"
+
+    with locks.exclusive(receipt):
+        kernel_path = locks.kernel_lock_path(receipt)
+        assert kernel_path.parent == tmp_path / "kernel-locks"
+        assert kernel_path.is_file()
+        assert kernel_path != receipt
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits are not enforced on Windows")
+def test_kernel_lock_directory_and_file_are_private(tmp_path: Path):
+    receipt = tmp_path / "browser.lock"
+
+    with locks.exclusive(receipt):
+        kernel_path = locks.kernel_lock_path(receipt)
+        assert kernel_path.parent.stat().st_mode & 0o777 == 0o700
+        assert kernel_path.stat().st_mode & 0o777 == 0o600

@@ -3,6 +3,11 @@
 **질문:** gjc 세션 자체를 Sol Pro로 돌릴 수 있나?
 **답:** 된다. **default 모델 하나로 붙이고, 서브에이전트는 붙이지 않는다.**
 
+**플랫폼 경계 (2026-09-02):** 이 Pi/GJC 경로에 필요한 `lane serve`는
+macOS·Windows·Linux에서 지원한다. 파일 패킹·영수증 경계까지 포함하는
+`review`·`harvest`·`followup`은 macOS·Linux, `bubblewrap` 격리가 필요한
+`lane drive`·`repair`는 Linux 전용이다.
+
 ## 확인된 사실 (2026-08-12 실측)
 
 ### 1. gjc는 커스텀 OpenAI 호환 provider를 받는다
@@ -165,8 +170,9 @@ profiles:
    토큰을 상수시간으로 비교하고, 큐에서 기다리다 끊긴 클라이언트의 요청은 메시지를
    쓰기 전에 취소한다.
 2. ~~동시 요청 직렬화 (브라우저 1개 전제)~~ — 프로세스 안의 `threading.Lock` 위에
-   머신 전체 락이 하나 더 있다. 락은 파일이 아니라 커널 이름이다: `flock`은 inode를
-   잠그므로 락 파일을 지우면 배타가 풀렸다(2026-08-13 감사).
+   머신 전체 OS 락이 하나 더 있다. POSIX는 `flock`, Windows는 `msvcrt.locking`을
+   쓰며 실제 락 파일은 변경 가능한 worktree·응답 폴더 밖의 사용자 전용 상태
+   디렉터리에 둔다. 표시용 PID 파일이 삭제·교체돼도 배타는 풀리지 않는다.
 3. ~~tool call 브리지~~ — `tools.py`가 스펙을 프롬프트로 내리고 답을 파싱해
    `tool_calls`로 되돌린다. 파싱 실패는 502, `tool_choice: required`는 400(산문
    브리지는 강제할 수 없다), 도구가 없으면 펜스도 그냥 텍스트다. 호출로 보이는 것이

@@ -16,7 +16,6 @@ import hashlib
 import locale
 import os
 import queue
-import selectors
 import signal
 import shutil
 import shlex
@@ -25,6 +24,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
+from contextlib import contextmanager
 from pathlib import Path
 from secrets import token_hex
 
@@ -265,17 +265,63 @@ def sanitized_env(extra_keys: tuple[str, ...] = ()) -> dict[str, str]:
     }
 
 
+@contextmanager
+def _managed_process(command: list[str], *, cwd: Path | None, env: dict[str, str] | None,
+                     stdout, stderr, allow_descendants: bool = False):
+    """Spawn a child in an OS process container tracked for this context."""
+    platform_options = (
+        {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+        if os.name == "nt"
+        else {"start_new_session": True}
+    )
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=env,
+        stdout=stdout,
+        stderr=stderr,
+        **platform_options,
+    )
+    job_handle = None
+    try:
+        if os.name == "nt":
+            from . import winjob
+
+            try:
+                job_handle = winjob.attach(process, kill_on_close=not allow_descendants)
+            except BaseException:
+                process.kill()
+                process.wait()
+                raise
+            setattr(process, "_lane_job_handle", job_handle)
+        with process:
+            yield process
+    finally:
+        if job_handle is not None:
+            from . import winjob
+
+            winjob.close(job_handle)
+
+
 def run(command: list[str], *, cwd: Path | None = None, env: dict[str, str] | None = None,
-        timeout: float | None = None, capture: bool = True) -> Completed:
+        timeout: float | None = None, capture: bool = True,
+        allow_descendants: bool = False) -> Completed:
     """Run *command* to completion with bounded captured output.
 
-    Captured streams retain at most MAX_OUTPUT_CHARS each.  Truncated output
-    starts with TRUNCATION_NOTICE and retains the newest text.
+    Successful launchers may opt into persistent children (the dedicated
+    browser started by ``--ensure-env``). Timeouts and interruptions still
+    terminate the entire process container.
     """
     pipe = subprocess.PIPE if capture else None
     deadline = None if timeout is None else time.monotonic() + timeout
-    with subprocess.Popen(command, cwd=cwd, env=env,
-                          stdout=pipe, stderr=pipe, start_new_session=True) as process:
+    with _managed_process(
+        command,
+        cwd=cwd,
+        env=env,
+        stdout=pipe,
+        stderr=pipe,
+        allow_descendants=allow_descendants,
+    ) as process:
         try:
             if capture:
                 stdout, stderr, stdout_cut, stderr_cut = _drain_output(
@@ -289,7 +335,7 @@ def run(command: list[str], *, cwd: Path | None = None, env: dict[str, str] | No
         except BaseException:  # timeout, SIGINT, SIGTERM-turned-SystemExit
             _stop(process)
             raise
-        if _group_exists(process):
+        if not allow_descendants and _group_exists(process):
             _stop(process)
     return Completed(returncode=process.returncode, stdout=stdout or "", stderr=stderr or "")
 
@@ -307,9 +353,9 @@ def run_tail(command: list[str], *, cwd: Path | None = None, env: dict[str, str]
     if limit < 1:
         raise ValueError("limit must be positive")
     deadline = None if timeout is None else time.monotonic() + timeout
-    with subprocess.Popen(command, cwd=cwd, env=env,
-                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                          start_new_session=True) as process:
+    with _managed_process(
+        command, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    ) as process:
         try:
             tail = _drain_tail(process.stdout, keep=limit * BYTES_PER_CHAR, deadline=deadline)
             # The wait needs the deadline too: a child that closes its output and
@@ -339,9 +385,9 @@ def run_relay(command: list[str], *, cwd: Path | None = None, env: dict[str, str
     relaying itself remains unbounded so operators still see all progress.
     """
     deadline = None if timeout is None else time.monotonic() + timeout
-    with subprocess.Popen(command, cwd=cwd, env=env,
-                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                          start_new_session=True) as process:
+    with _managed_process(
+        command, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    ) as process:
         try:
             stdout, _, cut, _ = _drain_output(process, deadline=deadline, relay=True)
         except BaseException:  # timeout, SIGINT, SIGTERM-turned-SystemExit
@@ -355,16 +401,16 @@ def run_relay(command: list[str], *, cwd: Path | None = None, env: dict[str, str
 
 def _drain_output(process: subprocess.Popen, *, deadline: float | None,
                   relay: bool = False) -> tuple[bytes, bytes, bool, bool]:
-    """Drain process pipes without allowing a quiet partial line to block."""
+    """Drain process pipes with bounded reader threads on every supported OS."""
     streams = ((process.stdout, "stdout"), (process.stderr, "stderr"))
     buffers = {"stdout": bytearray(), "stderr": bytearray()}
     cut = {"stdout": False, "stderr": False}
     keep = MAX_OUTPUT_CHARS * BYTES_PER_CHAR
-    selector = selectors.DefaultSelector()
-    decoder = codecs.getincrementaldecoder(locale.getencoding())() if relay else None
     relay_queue: queue.Queue[str] | None = queue.Queue(maxsize=64) if relay else None
     relay_stop = threading.Event()
     relay_writer = None
+    errors: queue.SimpleQueue[BaseException] = queue.SimpleQueue()
+
     if relay_queue is not None:
         def write_relay():
             while not relay_stop.is_set() or not relay_queue.empty():
@@ -389,35 +435,42 @@ def _drain_output(process: subprocess.Popen, *, deadline: float | None,
         except queue.Full:
             pass
 
-    try:
-        for stream, name in streams:
-            if stream is not None:
-                selector.register(stream, selectors.EVENT_READ, name)
-        while selector.get_map():
-            remaining = None if deadline is None else deadline - time.monotonic()
-            if remaining is not None and remaining <= 0:
-                raise subprocess.TimeoutExpired(cmd=process.args, timeout=0)
-            events = selector.select(remaining)
-            if not events:
-                raise subprocess.TimeoutExpired(cmd=process.args, timeout=0)
-            for key, _ in events:
-                chunk = key.fileobj.read1(READ_CHUNK_BYTES)
-                name = key.data
-                if not chunk:
-                    selector.unregister(key.fileobj)
-                    continue
-                if relay:
+    def read_stream(stream, name: str) -> None:
+        decoder = codecs.getincrementaldecoder(locale.getencoding())() if relay else None
+        read = getattr(stream, "read1", stream.read)
+        try:
+            while chunk := read(READ_CHUNK_BYTES):
+                if decoder is not None:
                     emit_relay(decoder.decode(chunk))
                 buffer = buffers[name]
                 buffer += chunk
                 if len(buffer) > keep:
                     del buffer[:-keep]
                     cut[name] = True
-        process.wait(None if deadline is None else max(deadline - time.monotonic(), 0.0))
-        if decoder is not None:
-            emit_relay(decoder.decode(b"", final=True))
+            if decoder is not None:
+                emit_relay(decoder.decode(b"", final=True))
+        except BaseException as error:
+            errors.put(error)
+
+    readers = [
+        threading.Thread(target=read_stream, args=(stream, name), daemon=True)
+        for stream, name in streams
+        if stream is not None
+    ]
+    for reader in readers:
+        reader.start()
+
+    try:
+        remaining = None if deadline is None else max(deadline - time.monotonic(), 0.0)
+        process.wait(timeout=remaining)
+        for reader in readers:
+            remaining = None if deadline is None else max(deadline - time.monotonic(), 0.0)
+            reader.join(timeout=remaining)
+            if reader.is_alive():
+                raise subprocess.TimeoutExpired(cmd=process.args, timeout=0)
+        if not errors.empty():
+            raise errors.get()
     finally:
-        selector.close()
         relay_stop.set()
         if relay_writer is not None:
             remaining = 1.0 if deadline is None else max(deadline - time.monotonic(), 0.0)
@@ -440,40 +493,36 @@ def _decode_output(output: bytes) -> str:
 
 
 def _drain_tail(stream, *, keep: int, deadline: float | None = None) -> bytes:
-    """Read *stream* to EOF holding at most ~2x *keep* bytes at any moment.
-
-    With a deadline, a stream that goes quiet without closing cannot pin the
-    caller: the write end can outlive the child that was spawned with it.
-    """
+    """Read *stream* to EOF in a bounded reader thread on every supported OS."""
     buffer = bytearray()
-    selector = selectors.DefaultSelector() if deadline is not None else None
-    if selector is not None:
-        selector.register(stream, selectors.EVENT_READ)
-    try:
-        while True:
-            if selector is not None:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0 or not selector.select(remaining):
-                    raise subprocess.TimeoutExpired(cmd="run_tail", timeout=0)
-                chunk = stream.read1(READ_CHUNK_BYTES)
-            else:
-                chunk = stream.read(READ_CHUNK_BYTES)
-            if not chunk:
-                return bytes(buffer[-keep:])
-            buffer += chunk
-            if len(buffer) > 2 * keep:
-                del buffer[:-keep]
-    finally:
-        if selector is not None:
-            selector.close()
+    errors: queue.SimpleQueue[BaseException] = queue.SimpleQueue()
+
+    def read_stream() -> None:
+        read = getattr(stream, "read1", stream.read)
+        try:
+            while chunk := read(READ_CHUNK_BYTES):
+                buffer.extend(chunk)
+                if len(buffer) > 2 * keep:
+                    del buffer[:-keep]
+        except BaseException as error:
+            errors.put(error)
+
+    reader = threading.Thread(target=read_stream, daemon=True)
+    reader.start()
+    remaining = None if deadline is None else max(deadline - time.monotonic(), 0.0)
+    reader.join(timeout=remaining)
+    if reader.is_alive():
+        raise subprocess.TimeoutExpired(cmd="run_tail", timeout=0)
+    if not errors.empty():
+        raise errors.get()
+    return bytes(buffer[-keep:])
 
 
 def _stop(process: subprocess.Popen) -> None:
-    _signal_group(process, signal.SIGTERM)
+    _signal_group(process, force=False)
     deadline = time.monotonic() + TERMINATE_GRACE_SECONDS
     while time.monotonic() < deadline:
-        # Reap an exited leader while continuing to inspect its original group:
-        # otherwise its zombie keeps killpg(..., 0) reporting a live group.
+        # Reap an exited leader while continuing to inspect its original group.
         try:
             process.wait(0)
         except subprocess.TimeoutExpired:
@@ -485,30 +534,53 @@ def _stop(process: subprocess.Popen) -> None:
             break
         time.sleep(min(0.05, remaining))
     if _group_exists(process):
-        _signal_group(process, signal.SIGKILL)
+        _signal_group(process, force=True)
     try:
         process.wait()
     except ChildProcessError:
         pass
 
 
-def _signal_group(process: subprocess.Popen, sig: int) -> None:
-    """Signal the child's whole session; fall back to the child alone."""
+def _signal_group(process: subprocess.Popen, *, force: bool) -> None:
+    """Terminate the child's whole process container; fall back to its leader."""
+    if os.name == "nt":
+        handle = getattr(process, "_lane_job_handle", None)
+        if handle is not None:
+            from . import winjob
+
+            winjob.terminate(handle, exit_code=137 if force else 1)
+            return
+        try:
+            process.kill() if force else process.terminate()
+        except ProcessLookupError:
+            pass
+        return
+
+    signal_to_send = signal.SIGKILL if force else signal.SIGTERM
     try:
-        # start_new_session makes the leader PID the process-group ID.  Looking
-        # up the leader's current PGID fails once it exits, while descendants in
-        # its original group can still be alive.
-        os.killpg(process.pid, sig)
+        # start_new_session makes the leader PID the process-group ID. Looking
+        # up its current PGID fails once it exits while descendants may survive.
+        os.killpg(process.pid, signal_to_send)
         return
     except (ProcessLookupError, PermissionError, OSError):
         pass
     try:
-        process.send_signal(sig)
+        process.send_signal(signal_to_send)
     except ProcessLookupError:
         pass
 
 
 def _group_exists(process: subprocess.Popen) -> bool:
+    if os.name == "nt":
+        handle = getattr(process, "_lane_job_handle", None)
+        if handle is not None:
+            from . import winjob
+
+            try:
+                return winjob.active_processes(handle) > 0
+            except OSError:
+                pass
+        return process.poll() is None
     try:
         os.killpg(process.pid, 0)
     except (ProcessLookupError, PermissionError, OSError):
