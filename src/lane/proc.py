@@ -269,11 +269,10 @@ def sanitized_env(extra_keys: tuple[str, ...] = ()) -> dict[str, str]:
 def _managed_process(command: list[str], *, cwd: Path | None, env: dict[str, str] | None,
                      stdout, stderr, allow_descendants: bool = False):
     """Spawn a child in an OS process container tracked for this context."""
-    platform_options = (
-        {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
-        if os.name == "nt"
-        else {"start_new_session": True}
-    )
+    if os.name == "nt":  # pragma: no cover - exercised by the Windows CI matrix
+        platform_options = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    else:
+        platform_options = {"start_new_session": True}
     process = subprocess.Popen(
         command,
         cwd=cwd,
@@ -284,7 +283,7 @@ def _managed_process(command: list[str], *, cwd: Path | None, env: dict[str, str
     )
     job_handle = None
     try:
-        if os.name == "nt":
+        if os.name == "nt":  # pragma: no cover - exercised by the Windows CI matrix
             from . import winjob
 
             try:
@@ -297,7 +296,7 @@ def _managed_process(command: list[str], *, cwd: Path | None, env: dict[str, str
         with process:
             yield process
     finally:
-        if job_handle is not None:
+        if job_handle is not None:  # pragma: no cover - Windows-only cleanup
             from . import winjob
 
             winjob.close(job_handle)
@@ -543,7 +542,7 @@ def _stop(process: subprocess.Popen) -> None:
 
 def _signal_group(process: subprocess.Popen, *, force: bool) -> None:
     """Terminate the child's whole process container; fall back to its leader."""
-    if os.name == "nt":
+    if os.name == "nt":  # pragma: no cover - exercised by the Windows CI matrix
         handle = getattr(process, "_lane_job_handle", None)
         if handle is not None:
             from . import winjob
@@ -571,7 +570,7 @@ def _signal_group(process: subprocess.Popen, *, force: bool) -> None:
 
 
 def _group_exists(process: subprocess.Popen) -> bool:
-    if os.name == "nt":
+    if os.name == "nt":  # pragma: no cover - exercised by the Windows CI matrix
         handle = getattr(process, "_lane_job_handle", None)
         if handle is not None:
             from . import winjob

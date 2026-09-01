@@ -56,6 +56,8 @@ testpaths = ["tests"]
 [tool.coverage.run]
 branch = true
 source = ["lane"]
+# The Windows matrix exercises this module; it cannot be imported by Linux coverage.
+omit = ["src/lane/winjob.py"]
 
 [tool.coverage.report]
 fail_under = 85

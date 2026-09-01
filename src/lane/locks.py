@@ -43,10 +43,10 @@ def lock_directory() -> Path:
     override = os.environ.get(LOCK_DIR_ENV)
     if override:
         return Path(override).expanduser()
-    if os.name == "nt":
+    if os.name == "nt":  # pragma: no cover - exercised by the Windows CI matrix
         base = os.environ.get("LOCALAPPDATA")
         return (Path(base) if base else Path.home() / "AppData" / "Local") / "sol-lane" / "locks"
-    if sys.platform == "darwin":
+    if sys.platform == "darwin":  # pragma: no cover - exercised by the macOS CI matrix
         return Path.home() / "Library" / "Application Support" / "sol-lane" / "locks"
     base = os.environ.get("XDG_STATE_HOME")
     return (Path(base).expanduser() if base else Path.home() / ".local" / "state") / "sol-lane" / "locks"
@@ -107,7 +107,7 @@ def _open_kernel_lock(path: Path) -> int:
             raise PermissionError(f"lock directory is not owned by this user: {directory}")
         if stat.S_IMODE(details.st_mode) != 0o700:
             directory.chmod(0o700)
-    elif path.is_symlink():
+    elif path.is_symlink():  # pragma: no cover - exercised by the Windows CI matrix
         raise OSError(f"lock file cannot be a symlink: {path}")
 
     flags = os.O_RDWR | os.O_CREAT
@@ -124,7 +124,7 @@ def _open_kernel_lock(path: Path) -> int:
 
 
 def _try_lock(descriptor: int) -> None:
-    if os.name == "nt":
+    if os.name == "nt":  # pragma: no cover - exercised by the Windows CI matrix
         import msvcrt
 
         if os.fstat(descriptor).st_size == 0:
@@ -139,7 +139,7 @@ def _try_lock(descriptor: int) -> None:
 
 
 def _unlock(descriptor: int) -> None:
-    if os.name == "nt":
+    if os.name == "nt":  # pragma: no cover - exercised by the Windows CI matrix
         import msvcrt
 
         os.lseek(descriptor, 0, os.SEEK_SET)

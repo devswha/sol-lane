@@ -35,9 +35,12 @@ jobs:
       - name: Install locked development environment
         run: uv sync --locked --extra dev
       - name: Install required sandbox runtime
-        run: sudo apt-get update -qq && sudo apt-get install --yes bubblewrap
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install --yes bubblewrap
+          sudo chmod 4755 "$(command -v bwrap)"
       - name: Verify required sandbox runtime
-        run: command -v bwrap
+        run: bwrap --ro-bind / / --proc /proc --dev /dev -- /bin/true
       - name: Lint
         run: uv run --locked ruff check .
       - name: Scan source for security issues
