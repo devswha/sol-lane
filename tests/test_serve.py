@@ -405,6 +405,23 @@ def test_handler_pool_refuses_connections_after_its_concurrency_limit():
         httpd.server_close()
 
 
+def test_handler_pool_closes_a_disconnected_rejected_client():
+    class DisconnectedRequest:
+        def sendall(self, _payload):
+            raise ConnectionResetError
+
+    httpd = object.__new__(serve_module.BoundedThreadingHTTPServer)
+    httpd._handler_slots = threading.BoundedSemaphore(1)
+    httpd._handler_slots.acquire()
+    closed = []
+    httpd.shutdown_request = closed.append
+    request = DisconnectedRequest()
+
+    httpd.process_request(request, ("127.0.0.1", 1))
+
+    assert closed == [request]
+
+
 def test_an_empty_tools_array_still_works(server):
     response = post(f"{server}/v1/chat/completions",
                     {"messages": [{"role": "user", "content": "hi"}], "tools": []})
