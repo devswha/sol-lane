@@ -35,6 +35,7 @@ ROLE_LABELS = {"system": "SYSTEM", "user": "USER", "assistant": "ASSISTANT", "to
 MAX_CONTENT_LENGTH = 1_048_576
 REQUEST_TIMEOUT_SECONDS = 15.0
 MAX_CONCURRENT_HANDLERS = 16
+REJECTION_DRAIN_BYTES = 65_536
 TRANSCRIPT_HEADER = (
     "You are the assistant in an ongoing conversation. The full transcript follows. "
     "Reply with the assistant's next message only — no transcript, no role labels, "
@@ -602,8 +603,27 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
         super().__init__(server_address, RequestHandlerClass)
         self._handler_slots = threading.BoundedSemaphore(max_handlers)
 
+    @staticmethod
+    def _drain_pending_input(request) -> None:
+        """Avoid a Windows RST discarding the 503 when request bytes are unread."""
+        previous_timeout = request.gettimeout()
+        drained = 0
+        try:
+            request.setblocking(False)
+            while drained < REJECTION_DRAIN_BYTES:
+                chunk = request.recv(min(8192, REJECTION_DRAIN_BYTES - drained))
+                if not chunk:
+                    break
+                drained += len(chunk)
+        except (BlockingIOError, InterruptedError, OSError):
+            pass
+        finally:
+            request.settimeout(previous_timeout)
+
+
     def process_request(self, request, client_address):
         if not self._handler_slots.acquire(blocking=False):
+            self._drain_pending_input(request)
             body = b'{"error":{"message":"service unavailable","type":"lane_delivery_error"}}'
             try:
                 request.sendall(
